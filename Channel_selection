@@ -1,0 +1,882 @@
+function ChannelSelection_SP()
+clear; close all; clc;
+
+PID          = 'F15';
+CONDITIONS   = {'C1','C2','C3','C4'};
+BLOCKS       = [1, 2];
+
+DATA_FOLDER  = sprintf('/Users', PID);
+OUT_FOLDER   = fullfile(DATA_FOLDER,'SP_Results');
+if ~exist(OUT_FOLDER,'dir'), mkdir(OUT_FOLDER); end
+
+BASELINE_10  = fullfile(DATA_FOLDER, sprintf('%s_10%%Baseline.mat', PID));
+BASELINE_20  = fullfile(DATA_FOLDER, sprintf('%s_20%%Baseline.mat', PID));
+OUT_FILE     = fullfile(OUT_FOLDER, sprintf('%s_channel_selection_final.mat', PID));
+
+TRIG_FIELD   = 'QC_AUX_7';
+FORCE_FIELD  = 'QC_AUX_1';
+FIRST_TRIG   = 2;
+
+%% Preprocessing 
+NOTCH_BW     = 2;
+HP_CUTOFF    = 20;
+LP_CUTOFF    = 450;
+FILT_ORDER   = 4;
+
+%% Baseline screening
+MIN_RMS_CONT   = 0.01;
+MAX_REST_RATIO = 0.50;
+MIN_SNR        = 1.5;
+N_CANDIDATES   = 25;
+
+%% SP propagation
+PROP_WIN_MS    = 25;
+GRAD_SMOOTH_MS = 15;
+RMS_MS         = 20;  
+
+%% Final channel selection
+N_FINAL_CH   = 14;
+
+%% Epoch
+PRE_TMS_MS   = 50;
+POST_TMS_MS  = 300;
+YLV          = 1.5;
+
+%% Validation figure display smoothing 
+%% detection/propagation, purely cosmetic for the mean-trace plot).
+SMOOTH_MS    = 15;
+
+%% Colours
+COL_EMG    = [0.10 0.10 0.10];
+COL_MEP    = [0.90 0.90 0.90];
+COL_TMS    = [0.70 0.10 0.10];
+COL_ONSET  = [0.15 0.45 0.75];
+COL_OFFSET = [0.85 0.60 0.10];
+COL_ZERO   = [0.55 0.55 0.55];
+FONT_NAME  = 'Helvetica';
+
+fprintf('=== %s Channel Selection + SP Detection ===\n\n',PID);
+
+%% ===================================================================
+%% STEP 1: BASELINE SCREENING — exclude bad channels
+%% Use force (AUX1) to identify rest vs contraction windows
+%% ===================================================================
+fprintf('STEP 1: Baseline channel screening\n');
+fprintf('%s\n',repmat('-',1,50));
+
+[candidateCh_10, chSNRAll_10] = screenBaseline(BASELINE_10, FORCE_FIELD, ...
+    MIN_RMS_CONT, MAX_REST_RATIO, MIN_SNR, ...
+    N_CANDIDATES, NOTCH_BW, HP_CUTOFF, LP_CUTOFF, FILT_ORDER);
+
+[candidateCh_20, chSNRAll_20] = screenBaseline(BASELINE_20, FORCE_FIELD, ...
+    MIN_RMS_CONT, MAX_REST_RATIO, MIN_SNR, ...
+    N_CANDIDATES, NOTCH_BW, HP_CUTOFF, LP_CUTOFF, FILT_ORDER);
+
+fprintf('  10%% MVC candidates (%d): %s\n', length(candidateCh_10), num2str(candidateCh_10));
+fprintf('  20%% MVC candidates (%d): %s\n', length(candidateCh_20), num2str(candidateCh_20));
+
+%% ===================================================================
+%% STEP 1b: BASELINE SCREENING FIGURE — grid layout, SNR & selected
+%% channels, for both MVC levels (matches the reference figure style)
+%% ===================================================================
+fprintf('\nSTEP 1b: Generating baseline screening figure\n');
+fprintf('%s\n',repmat('-',1,50));
+
+cLimBase = safeCLim([chSNRAll_10, chSNRAll_20]);
+
+baselinePanels(1) = struct('values', chSNRAll_10, 'mode', 'all', ...
+    'highlightSet', [], 'titleStr', 'All channels');
+baselinePanels(2) = struct('values', chSNRAll_10, 'mode', 'selected', ...
+    'highlightSet', candidateCh_10, 'titleStr', sprintf('Selected  n=%d', numel(candidateCh_10)));
+baselinePanels(3) = struct('values', chSNRAll_20, 'mode', 'all', ...
+    'highlightSet', [], 'titleStr', 'All channels');
+baselinePanels(4) = struct('values', chSNRAll_20, 'mode', 'selected', ...
+    'highlightSet', candidateCh_20, 'titleStr', sprintf('Selected  n=%d', numel(candidateCh_20)));
+
+groupHeaders = { ...
+    struct('text','10% MVC','pos',[0.15 0.90 0.30 0.05],'color',[0.15 0.35 0.75]), ...
+    struct('text','20% MVC','pos',[0.58 0.90 0.30 0.05],'color',[0.70 0.10 0.10]) ...
+    };
+
+drawChannelGridFigure(baselinePanels, groupHeaders, ...
+    sprintf('%s  --  Channel Selection: SNR & Selected Channels', PID), ...
+    cLimBase, fullfile(OUT_FOLDER, sprintf('%s_ChannelSelection_Baseline', PID)));
+
+%% ===================================================================
+%% STEP 1c: AUTO-SELECT REFERENCE CHANNEL
+%% ===================================================================
+fprintf('\nSTEP 1c: Auto-selecting reference channel (best baseline SNR)\n');
+fprintf('%s\n',repmat('-',1,50));
+
+commonCand = intersect(candidateCh_10, candidateCh_20);
+if isempty(commonCand)
+    warning('No channel passed baseline screening at BOTH MVC levels - falling back to the 10%% MVC candidate list only.');
+    commonCand = candidateCh_10;
+end
+combinedSNR = mean([chSNRAll_10(commonCand); chSNRAll_20(commonCand)], 1, 'omitnan');
+[bestSNR, bestIdx] = max(combinedSNR);
+REF_CH = commonCand(bestIdx);
+fprintf('  Reference channel: Ch%d (mean baseline SNR = %.2f across both MVC levels)\n', REF_CH, bestSNR);
+
+%% ===================================================================
+%% STEP 2: MANUAL CLICK ON REFERENCE CHANNEL 
+%% ===================================================================
+fprintf('\nSTEP 2: Manual SP clicking on Ch%d (auto-selected reference)\n',REF_CH);
+fprintf('%s\n',repmat('-',1,50));
+fprintf('Display: filtered EMG only (50Hz notch + %d-%dHz bandpass)\n',HP_CUTOFF,LP_CUTOFF);
+fprintf('LEFT CLICK = SP offset | RIGHT CLICK = skip\n\n');
+
+clickedSP  = cell(length(CONDITIONS), length(BLOCKS));
+Fs_global  = [];
+refCh      = REF_CH;
+
+for cIdx = 1:length(CONDITIONS)
+    cond = CONDITIONS{cIdx};
+    for bIdx = 1:length(BLOCKS)
+        blk     = BLOCKS(bIdx);
+        rawFile = fullfile(DATA_FOLDER,sprintf('%s_%s_%d.mat',PID,cond,blk));
+        if ~isfile(rawFile)
+            warning('Not found: %s',rawFile); continue;
+        end
+
+        raw    = matfile(rawFile);
+        allVar = who(raw);
+
+        % Fs
+        Fs=[];
+        for n=1:64
+            fn=sprintf('QC_MULT_%d',n);
+            if ismember(fn,allVar), st=raw.(fn); Fs=round(1/st.interval); break; end
+        end
+        if isempty(Fs), continue; end
+        if isempty(Fs_global), Fs_global=Fs; end
+
+        % Filters
+        [bn,an]       = iirnotch(50/(Fs/2),NOTCH_BW/(Fs/2));
+        [bn100,an100] = iirnotch(100/(Fs/2),NOTCH_BW/(Fs/2));
+        [bb,ab]       = butter(FILT_ORDER,[HP_CUTOFF LP_CUTOFF]/(Fs/2),'bandpass');
+
+        % Triggers
+        tSt   = raw.(TRIG_FIELD);
+        tFull = double(tSt.values)*tSt.scale+tSt.offset;
+        tEdge = find(diff(tFull>0.5*max(tFull))==1)+1;
+        if length(tEdge)<FIRST_TRIG, continue; end
+        triggers = tEdge(FIRST_TRIG:end);
+        nTrials  = length(triggers);
+
+        preSamp  = round(PRE_TMS_MS/1000*Fs);
+        postSamp = round(POST_TMS_MS/1000*Fs);
+        tMs      = (-preSamp:postSamp-1)/Fs*1000;
+
+        % Load + filter reference channel — filtered signal only, no RMS
+        cf = sprintf('QC_MULT_%d',REF_CH);
+        if ~ismember(cf,allVar)
+            warning('Ch%d not found in %s %s B%d',REF_CH,PID,cond,blk);
+            continue;
+        end
+        st  = raw.(cf);
+        sig = (double(st.values)*st.scale+st.offset)*1000;
+        sigF= filtfilt(bb,ab,filtfilt(bn100,an100,filtfilt(bn,an,sig)));
+
+        % Auto-detect SP onset (used as visual guide only)
+        rmsSamp  = round(RMS_MS/1000*Fs);
+        silSamp  = round(5/1000*Fs);
+        spOnset  = nan(nTrials,1);
+        for tr=1:nTrials
+            tg=triggers(tr); i0=tg-preSamp; i1=tg+postSamp-1;
+            if i0<1||i1>length(sigF), spOnset(tr)=60; continue; end
+            ep    = sigF(i0:i1);
+            epRMS = sqrt(movmean(ep.^2,rmsSamp));
+            preMsk= tMs>=-50 & tMs<=-5;
+            bN    = std(epRMS(preMsk)); if bN<eps, bN=eps; end
+            thresh= 2.0*bN;
+            sIdx  = find(tMs>=15 & tMs<=100);
+            below = epRMS(sIdx)<thresh;
+            foundOn=NaN;
+            for ii=1:max(1,length(below)-silSamp+1)
+                if all(below(ii:min(end,ii+silSamp-1)))
+                    foundOn=sIdx(ii); break;
+                end
+            end
+            if ~isnan(foundOn), spOnset(tr)=tMs(foundOn);
+            else, spOnset(tr)=60; end
+        end
+
+        % Clicking window — show FILTERED signal directly
+        spOffset = nan(nTrials,1);
+        trSkip   = false(nTrials,1);
+
+        hC=figure('Name',sprintf('SP Offset | %s %s B%d | Ch%d (filtered EMG)', ...
+                  PID,cond,blk,REF_CH), ...
+                  'Color','w','Units','normalized','Position',[0.05 0.08 0.90 0.78]);
+
+        for tr=1:nTrials
+            tg=triggers(tr); i0=tg-preSamp; i1=tg+postSamp-1;
+            if i0<1||i1>length(sigF), trSkip(tr)=true; continue; end
+
+            % Display: filtered signal only — no smoothing, no RMS
+            ep = sigF(i0:i1);
+
+            % Auto y-scale from this trial
+            yLv = max(abs(ep))*1.3;
+            if isnan(yLv)||yLv<0.1, yLv=YLV; end
+
+            clf(hC); ax=axes(hC); hold(ax,'on'); %#ok<LAXES>
+            patch(ax,[0 50 50 0],[-yLv -yLv yLv yLv],[0.92 0.92 0.92],'EdgeColor','none');
+            plot(ax,[tMs(1) tMs(end)],[0 0],'-','Color',COL_ZERO,'LineWidth',0.4);
+            xline(ax,0,'-','Color',COL_TMS,'LineWidth',1.5);
+            xline(ax,spOnset(tr),'--','Color',COL_ONSET,'LineWidth',1.2,'Alpha',0.8);
+            plot(ax,tMs,ep,'-','Color',COL_EMG,'LineWidth',0.9);
+            xlim(ax,[tMs(1) tMs(end)]); ylim(ax,[-yLv yLv]);
+            set(ax,'FontSize',11,'TickDir','out','Box','off');
+            xlabel(ax,'Time from TMS (ms)'); ylabel(ax,'EMG (mV)');
+            title(ax,sprintf('%s %s B%d Ch%d | Tr %d/%d | Blue=auto onset | LEFT=SP offset  RIGHT=skip', ...
+                  PID,cond,blk,REF_CH,tr,nTrials),'FontWeight','normal','FontSize',10);
+            grid(ax,'on'); drawnow;
+
+            [xC,~,btn]=ginput(1);
+            if btn==3
+                trSkip(tr)=true;
+                fprintf('  %s B%d Tr%2d: SKIPPED\n',cond,blk,tr);
+            else
+                spOffset(tr)=xC;
+                fprintf('  %s B%d Tr%2d: onset=%.1f  offset=%.1f  SP=%.1f ms\n', ...
+                        cond,blk,tr,spOnset(tr),xC,xC-spOnset(tr));
+            end
+        end
+        close(hC);
+
+        clickedSP{cIdx,bIdx} = struct('cond',cond,'blk',blk,'Fs',Fs, ...
+                                       'triggers',triggers,'tMs',tMs, ...
+                                       'spOnset',spOnset,'spOffset',spOffset, ...
+                                       'trSkip',trSkip,'nTrials',nTrials);
+    end
+end
+
+%% ===================================================================
+%% STEP 4: GRADIENT METHOD — propagate SP offset to all candidates
+%% ===================================================================
+fprintf('\nSTEP 4: Gradient propagation to candidate channels\n');
+fprintf('%s\n',repmat('-',1,50));
+
+% allSPdata.(key) stored per condition/block/channel
+allSPdata = struct();   %% FIX #4: was `{}` (cell) — dot-indexing a cell
+                         %% array errors in MATLAB; must be a struct so
+                         %% allSPdata.(key).field = ... works below.
+
+for cIdx=1:length(CONDITIONS)
+    cond = CONDITIONS{cIdx};
+    if ismember(cond,{'C1','C2'})
+        candCh = candidateCh_10;
+    else
+        candCh = candidateCh_20;
+    end
+    % NOTE: no "ensure refCh is in candCh" fallback needed here anymore -
+    % refCh is now chosen FROM intersect(candidateCh_10, candidateCh_20)
+    % (Step 1c), so it is guaranteed by construction to already be in
+    % both candidate lists. The previous version needed a fallback here
+    % specifically because Ch31 was a fixed, arbitrary channel that
+    % could fall outside the top-N baseline candidates.
+    nCand = length(candCh);
+
+    for bIdx=1:length(BLOCKS)
+        sp = clickedSP{cIdx,bIdx};
+        if isempty(sp), continue; end
+
+        rawFile = fullfile(DATA_FOLDER,sprintf('%s_%s_%d.mat',PID,cond,BLOCKS(bIdx)));
+        if ~isfile(rawFile), continue; end
+        raw    = matfile(rawFile);
+        allVar = who(raw);
+        Fs     = sp.Fs;
+
+        [bn,an]       = iirnotch(50/(Fs/2),NOTCH_BW/(Fs/2));
+        [bn100,an100] = iirnotch(100/(Fs/2),NOTCH_BW/(Fs/2));
+        [bb,ab]       = butter(FILT_ORDER,[HP_CUTOFF LP_CUTOFF]/(Fs/2),'bandpass');
+
+        preSamp    = round(PRE_TMS_MS/1000*Fs);
+        postSamp   = round(POST_TMS_MS/1000*Fs);
+        gradSmooth = round(GRAD_SMOOTH_MS/1000*Fs);
+        rmsSamp    = round(RMS_MS/1000*Fs);
+
+        fprintf('  %s B%d: propagating to %d channels...\n',cond,BLOCKS(bIdx),nCand);
+
+        for ci=1:nCand
+            ch = candCh(ci);
+            cf = sprintf('QC_MULT_%d',ch);
+            if ~ismember(cf,allVar), continue; end
+            st  = raw.(cf);
+            sig = (double(st.values)*st.scale+st.offset)*1000;
+            sigF= filtfilt(bb,ab,filtfilt(bn100,an100,filtfilt(bn,an,sig)));
+
+            spOffCh = nan(sp.nTrials,1);
+            % Reference channel: use clicked values directly
+            if ch==refCh
+                spOffCh = sp.spOffset;
+            else
+                for tr=1:sp.nTrials
+                    if sp.trSkip(tr)||isnan(sp.spOffset(tr)), continue; end
+                    tg=sp.triggers(tr);
+                    i0=tg-preSamp; i1=tg+postSamp-1;
+                    if i0<1||i1>length(sigF), continue; end
+                    ep    = sigF(i0:i1);
+                    epRMS = sqrt(movmean(ep.^2,rmsSamp));
+                    epSm  = movmean(epRMS,gradSmooth);
+
+                    % Search window: clicked time +/- PROP_WIN_MS
+                    clickT = sp.spOffset(tr);
+                    loT    = max(sp.spOnset(tr), clickT-PROP_WIN_MS);
+                    hiT    = clickT+PROP_WIN_MS;
+                    sMsk   = sp.tMs>=loT & sp.tMs<=hiT;
+                    sIdx   = find(sMsk);
+                    if length(sIdx)<3, spOffCh(tr)=clickT; continue; end
+
+                    % Gradient = rate of change of smoothed RMS
+                    grad = diff(epSm(sIdx));
+                    [~,maxI] = max(grad);
+                    spOffCh(tr) = sp.tMs(sIdx(maxI));
+                end
+            end
+
+            key = sprintf('c%d_b%d_ch%d',cIdx,bIdx,ci);
+            allSPdata.(key).condition  = cond;
+            allSPdata.(key).block      = BLOCKS(bIdx);
+            allSPdata.(key).channel    = ch;
+            allSPdata.(key).chIdx      = ci;
+            allSPdata.(key).condIdx    = cIdx;
+            allSPdata.(key).spOnset    = sp.spOnset;
+            allSPdata.(key).spOffset   = spOffCh;
+            allSPdata.(key).spDuration = spOffCh - sp.spOnset;
+            allSPdata.(key).trSkip     = sp.trSkip;
+            allSPdata.(key).nTrials    = sp.nTrials;
+        end
+    end
+end
+
+%% ===================================================================
+%% STEP 5: BASELINE-SNR RANKING
+%% ===================================================================
+fprintf('\nSTEP 5: Baseline-SNR ranking → select top %d channels, separately for 10%% and 20%% MVC\n',N_FINAL_CH);
+fprintf('%s\n',repmat('-',1,50));
+
+[selectedCh_10, chScoreAvg_10] = selectTopByBaselineSNR(candidateCh_10, chSNRAll_10, N_FINAL_CH, refCh, '10');
+[selectedCh_20, chScoreAvg_20] = selectTopByBaselineSNR(candidateCh_20, chSNRAll_20, N_FINAL_CH, refCh, '20');
+
+fprintf('\nSelected %d channels (10%% MVC): %s\n',length(selectedCh_10),num2str(selectedCh_10));
+fprintf('Selected %d channels (20%% MVC): %s\n',length(selectedCh_20),num2str(selectedCh_20));
+
+%% ===================================================================
+%% STEP 5b: FINAL CHANNEL SELECTION FIGURE 
+%% ===================================================================
+fprintf('\nSTEP 5b: Generating final channel selection figure\n');
+fprintf('%s\n',repmat('-',1,50));
+
+finalValues_10 = nan(1,64);
+finalValues_10(candidateCh_10) = chScoreAvg_10;
+finalValues_20 = nan(1,64);
+finalValues_20(candidateCh_20) = chScoreAvg_20;
+cLimFinal = safeCLim([finalValues_10, finalValues_20]);
+
+finalPanels(1) = struct('values', finalValues_10, 'mode', 'all', ...
+    'highlightSet', [], 'titleStr', 'All candidates (SP-SNR)');
+finalPanels(2) = struct('values', finalValues_10, 'mode', 'selected', ...
+    'highlightSet', selectedCh_10, 'titleStr', sprintf('Selected  n=%d (final)', numel(selectedCh_10)));
+finalPanels(3) = struct('values', finalValues_20, 'mode', 'all', ...
+    'highlightSet', [], 'titleStr', 'All candidates (SP-SNR)');
+finalPanels(4) = struct('values', finalValues_20, 'mode', 'selected', ...
+    'highlightSet', selectedCh_20, 'titleStr', sprintf('Selected  n=%d (final)', numel(selectedCh_20)));
+
+groupHeadersFinal = { ...
+    struct('text','10% MVC','pos',[0.15 0.90 0.30 0.05],'color',[0.15 0.35 0.75]), ...
+    struct('text','20% MVC','pos',[0.58 0.90 0.30 0.05],'color',[0.70 0.10 0.10]) ...
+    };
+
+drawChannelGridFigure(finalPanels, groupHeadersFinal, ...
+    sprintf('%s  --  Final Channel Selection: SP-SNR & Selected Channels', PID), ...
+    cLimFinal, fullfile(OUT_FOLDER, sprintf('%s_ChannelSelection_Final', PID)));
+
+%% ===================================================================
+%% STEP 6: SAVE RESULTS
+%% ===================================================================
+fprintf('\nSTEP 6: Saving results\n');
+fprintf('%s\n',repmat('-',1,50));
+
+% Build clean per-trial per-channel results table - each condition's
+% trials are matched against ITS OWN MVC-level channel selection
+% (C1/C2 -> selectedCh_10, C3/C4 -> selectedCh_20)
+results = struct('participant',{},'condition',{},'block',{},'trial',{}, ...
+    'channel',{},'isRefCh',{},'spOnset_ms',{},'spOffset_ms',{}, ...
+    'spDuration_ms',{});
+rIdx = 0;
+
+fields = fieldnames(allSPdata);
+for fi=1:length(fields)
+    d = allSPdata.(fields{fi});
+    if ismember(d.condition,{'C1','C2'})
+        relevantCh = selectedCh_10;
+    else
+        relevantCh = selectedCh_20;
+    end
+    if ~ismember(d.channel,relevantCh), continue; end
+    for tr=1:d.nTrials
+        if d.trSkip(tr)||isnan(d.spOffset(tr)), continue; end
+        rIdx=rIdx+1;
+        results(rIdx).participant   = PID;
+        results(rIdx).condition     = d.condition;
+        results(rIdx).block         = d.block;
+        results(rIdx).trial         = tr;
+        results(rIdx).channel       = d.channel;
+        results(rIdx).isRefCh       = (d.channel==refCh);
+        results(rIdx).spOnset_ms    = d.spOnset(tr);
+        results(rIdx).spOffset_ms   = d.spOffset(tr);
+        results(rIdx).spDuration_ms = d.spDuration(tr);
+    end
+end
+
+save(OUT_FILE,'results','selectedCh_10','selectedCh_20','refCh', ...
+    'candidateCh_10','candidateCh_20','chScoreAvg_10','chScoreAvg_20', ...
+    'PID','CONDITIONS','-v7.3');
+fprintf('Saved: %s\n',OUT_FILE);
+fprintf('Total records: %d\n',rIdx);
+
+%% ===================================================================
+%% STEP 6b: VALIDATION FIGURES 
+%% ===================================================================
+fprintf('\nGenerating validation figures...\n');
+drawValidationFigure(selectedCh_10, refCh, results, clickedSP, CONDITIONS, BLOCKS, ...
+    DATA_FOLDER, OUT_FOLDER, PID, NOTCH_BW, HP_CUTOFF, LP_CUTOFF, ...
+    FILT_ORDER, SMOOTH_MS, COL_EMG, COL_MEP, COL_TMS, ...
+    COL_ONSET, COL_OFFSET, FONT_NAME, 'C1', 'C2', '_10pctMVC');
+drawValidationFigure(selectedCh_20, refCh, results, clickedSP, CONDITIONS, BLOCKS, ...
+    DATA_FOLDER, OUT_FOLDER, PID, NOTCH_BW, HP_CUTOFF, LP_CUTOFF, ...
+    FILT_ORDER, SMOOTH_MS, COL_EMG, COL_MEP, COL_TMS, ...
+    COL_ONSET, COL_OFFSET, FONT_NAME, 'C4', 'C3', '_20pctMVC');
+
+fprintf('\n=== Done. Results in: %s ===\n',OUT_FOLDER);
+fprintf('Next: run MEP_SP_Summary.m\n');
+
+end
+
+function [candCh, chSNRAll] = screenBaseline(baseFile, forceField, minRmsCont, maxRestRatio, ...
+    minSNR, nCandidates, notchBW, hp, lp, filtOrd)
+fprintf('  Screening: %s\n', baseFile);
+chSNRAll = nan(1,64);
+if ~isfile(baseFile)
+    warning('Baseline file not found: %s',baseFile);
+    candCh = 1:64;
+    return;
+end
+
+raw    = matfile(baseFile);
+allVar = who(raw);
+
+% Fs
+Fs=[];
+for n=1:64
+    fn=sprintf('QC_MULT_%d',n);
+    if ismember(fn,allVar), st=raw.(fn); Fs=round(1/st.interval); break; end
+end
+if isempty(Fs), candCh=1:64; return; end
+
+% Detect rest vs contraction from force signal
+if ~ismember(forceField,allVar)
+    warning('Force field not found — using fixed time windows');
+    for n=1:64
+        fn=sprintf('QC_MULT_%d',n);
+        if ismember(fn,allVar), break; end
+    end
+    restIdx  = 1:round(30*Fs);
+    contIdx  = round(35*Fs):round(65*Fs);
+else
+    fSt   = raw.(forceField);
+    force = (double(fSt.values)*fSt.scale+fSt.offset)*1000;
+    force = movmean(force,round(0.5*Fs));
+
+    % Find contraction period: force > 20% of max
+    forceThresh = max(force)*0.20;
+    contMsk     = force > forceThresh;
+
+    % Rest: first ~25s where force is low
+    restEnd    = round(25*Fs);
+    restIdx    = find(~contMsk & (1:length(force))' <= restEnd);
+
+    % Contraction: sustained period above threshold
+    contIdx    = find(contMsk);
+    if isempty(restIdx), restIdx=1:round(20*Fs); end
+    if isempty(contIdx), contIdx=round(35*Fs):round(65*Fs); end
+
+    fprintf('    Rest: %d samples | Contraction: %d samples\n', ...
+            length(restIdx),length(contIdx));
+end
+
+% Build filters
+[bn,an]       = iirnotch(50/(Fs/2),notchBW/(Fs/2));
+[bn100,an100] = iirnotch(100/(Fs/2),notchBW/(Fs/2));
+[bb,ab]       = butter(filtOrd,[hp lp]/(Fs/2),'bandpass');
+
+% Score each channel
+chSNR    = nan(1,64);
+chRMScon = nan(1,64);
+chRMSrest= nan(1,64);
+
+for ch=1:64
+    cf=sprintf('QC_MULT_%d',ch);
+    if ~ismember(cf,allVar), continue; end
+    st  = raw.(cf);
+    sig = (double(st.values)*st.scale+st.offset)*1000;
+    sigF= filtfilt(bb,ab,filtfilt(bn100,an100,filtfilt(bn,an,sig)));
+
+    maxLen      = length(sigF);
+    rI          = restIdx(restIdx<=maxLen);
+    cI          = contIdx(contIdx<=maxLen);
+    if length(rI)<100||length(cI)<100, continue; end
+
+    rmsRest = rms(sigF(rI));
+    rmsCont = rms(sigF(cI));
+
+    chRMSrest(ch) = rmsRest;
+    chRMScon(ch)  = rmsCont;
+    if rmsRest>0, chSNR(ch)=rmsCont/rmsRest; end
+end
+
+% Apply exclusion criteria
+goodMsk = true(1,64);
+goodMsk(chRMScon < minRmsCont)               = false;  % dead
+goodMsk(chRMSrest > chRMScon * maxRestRatio) = false;  % noisy
+goodMsk(chSNR < minSNR)                      = false;  % low SNR
+goodMsk(isnan(chSNR))                        = false;
+
+goodCh = find(goodMsk);
+fprintf('    After exclusions: %d/%d channels remain\n',length(goodCh),64);
+
+% Take top N by SNR
+[~,si]  = sort(chSNR(goodCh),'descend');
+nTake   = min(nCandidates,length(si));
+candCh  = sort(goodCh(si(1:nTake)));   %% FIX #3: was si(1) — only ever
+                                        %% kept ONE candidate channel
+                                        %% instead of the top nTake.
+chSNRAll = chSNR;
+fprintf('    Top %d candidates: %s\n',nTake,num2str(candCh));
+end
+
+function [selCh, scoreOut] = selectTopByBaselineSNR(candCh, chSNRAll, nFinal, refCh, levelLabel)
+scoreOut = chSNRAll(candCh);  % aligned to candCh, 1x numel(candCh)
+
+for ki = 1:numel(candCh)
+    if ~isnan(scoreOut(ki))
+        fprintf('  [%s%% MVC] Ch%3d: baseline SNR=%.2f\n', levelLabel, candCh(ki), scoreOut(ki));
+    end
+end
+
+validMask = ~isnan(scoreOut);
+[~, sortI] = sort(scoreOut, 'descend', 'MissingPlacement', 'last');
+nSel = min(nFinal, sum(validMask));
+if nSel == 0
+    warning('[%s%% MVC] No candidates had a valid baseline SNR - using the first %d candidates by input order', levelLabel, nFinal);
+    selCh = sort(candCh(1:min(nFinal, end)));
+else
+    selCh = sort(candCh(sortI(1:nSel)));
+end
+
+% Always include reference channel - kept as a safety net even though
+% refCh now comes from the intersection of both candidate lists (Step
+% 1c): being a good CANDIDATE doesn't guarantee a top-14 SELECTED slot
+% in every edge case, so this check still has a real job to do here.
+if ~ismember(refCh, selCh)
+    if isempty(selCh)
+        selCh = refCh;
+    else
+        selCh = sort([selCh(1:end-1) refCh]);
+    end
+    fprintf('[%s%% MVC] Reference Ch%d added to selection\n', levelLabel, refCh);
+end
+
+end
+
+function drawValidationFigure(selectedCh, refCh, results, clickedSP, CONDITIONS, BLOCKS, ...
+    dataFolder, outFolder, PID, notchBW, hp, lp, filtOrd, ...
+    smoothMs, colEMG, colMEP, colTMS, colOnset, colOffset, fontName, ...
+    dispCond, dispCondFallback, outSuffix)
+nCh   = length(selectedCh);
+nCols = ceil(sqrt(nCh*1.5));
+nRows = ceil(nCh/nCols);
+
+figW=183/25.4; figH=min(16,nRows*2.5);
+hFig=figure('Color','w','Units','inches','Position',[1 1 figW figH], ...
+    'PaperUnits','inches','PaperSize',[figW figH],'PaperPosition',[0 0 figW figH]);
+
+ml=0.04; mr=0.01; mt=0.06; mb=0.04;
+spW=(1-ml-mr-0.008*(nCols-1))/nCols;
+spH=(1-mt-mb-0.010*(nRows-1))/nRows;
+
+cond = dispCond;  % default, in case selectedCh is empty and the loop below never runs
+
+% Get mean traces + SP markers per channel using dispCond (falls back to
+% dispCondFallback if that condition's data is unavailable) - the caller
+% picks a condition at the MATCHING MVC intensity to selectedCh, so a
+% 10%-MVC channel selection is validated against 10%-MVC trial data, etc.
+for ki=1:nCh
+    ch = selectedCh(ki);
+    row=ceil(ki/nCols); col=mod(ki-1,nCols)+1;
+    xP=ml+(col-1)*(spW+0.008); yP=mb+(nRows-row)*(spH+0.010);
+    ax=axes('Units','normalized','Position',[xP yP spW spH]); %#ok<LAXES>
+    hold(ax,'on');
+
+    allEp=[]; onTimes=[]; offTimes=[];
+    cond=dispCond; blkUse=1;
+
+    rawFile=fullfile(dataFolder,sprintf('%s_%s_%d.mat',PID,cond,blkUse));
+    if ~isfile(rawFile), cond=dispCondFallback; rawFile=fullfile(dataFolder,sprintf('%s_%s_%d.mat',PID,cond,blkUse)); end
+    if ~isfile(rawFile)
+        text(ax,0.5,0.5,'No data','Units','normalized','HorizontalAlignment','center','FontSize',7);
+        set(ax,'Box','off','XTick',{},'YTick',{}); continue;
+    end
+
+    raw2   = matfile(rawFile);
+    allVar2= who(raw2);
+    cf     = sprintf('QC_MULT_%d',ch);
+    if ~ismember(cf,allVar2)
+        text(ax,0.5,0.5,'Ch missing','Units','normalized','HorizontalAlignment','center','FontSize',7);
+        set(ax,'Box','off','XTick',{},'YTick',{}); continue;
+    end
+
+    % Find matching SP data
+    condIdx=find(strcmp(CONDITIONS,cond));
+    sp=clickedSP{condIdx,blkUse};
+    if isempty(sp)
+        set(ax,'Box','off','XTick',{},'YTick',{}); continue;
+    end
+
+    st2  = raw2.(cf);
+    sig2 = (double(st2.values)*st2.scale+st2.offset)*1000;
+    Fs2  = sp.Fs;
+    [bn2,an2]   = iirnotch(50/(Fs2/2),notchBW/(Fs2/2));
+    [bb2,ab2]   = butter(filtOrd,[hp lp]/(Fs2/2),'bandpass');
+    sigF2= filtfilt(bb2,ab2,filtfilt(bn2,an2,sig2));
+
+    preSamp2=round(50/1000*Fs2); postSamp2=round(300/1000*Fs2);
+    tMs2=(-preSamp2:postSamp2-1)/Fs2*1000;
+    smSamp=round(smoothMs/1000*Fs2);
+
+    for tr=1:sp.nTrials
+        if sp.trSkip(tr), continue; end
+        tg=sp.triggers(tr); i0=tg-preSamp2; i1=tg+postSamp2-1;
+        if i0<1||i1>length(sigF2), continue; end
+        allEp=[allEp;movmean(sigF2(i0:i1),smSamp)]; %#ok<AGROW>
+        onTimes(end+1)=sp.spOnset(tr); %#ok<AGROW>
+    end
+
+    % Get per-channel offsets from results
+    chMask=strcmp({results.condition},cond)&[results.block]==blkUse&[results.channel]==ch;
+    offRecs=results(chMask);
+    if ~isempty(offRecs), offTimes=[offRecs.spOffset_ms]; end
+
+    if isempty(allEp)
+        set(ax,'Box','off','XTick',{},'YTick',{}); continue;
+    end
+
+    meanEp=mean(allEp,1);
+    yLv=prctile(abs(meanEp),99)*1.5; if yLv<0.1, yLv=1; end
+
+    patch(ax,[0 50 50 0],[-yLv -yLv yLv yLv],colMEP,'EdgeColor','none');
+    plot(ax,[tMs2(1) tMs2(end)],[0 0],'-','Color',[0.7 0.7 0.7],'LineWidth',0.3);
+    xline(ax,0,'-','Color',colTMS,'LineWidth',0.7,'Alpha',0.7);
+    plot(ax,tMs2,meanEp,'-','Color',colEMG,'LineWidth',0.8);
+    if ~isempty(onTimes),  xline(ax,nanmedian(onTimes),'--','Color',colOnset,'LineWidth',1.0,'Alpha',0.9); end
+    if ~isempty(offTimes), xline(ax,nanmedian(offTimes),'--','Color',colOffset,'LineWidth',1.0,'Alpha',0.9); end
+
+    xlim(ax,[tMs2(1) tMs2(end)]); ylim(ax,[-yLv yLv]);
+    set(ax,'FontName',fontName,'FontSize',7,'TickDir','out','Box','off','XTickLabel',{},'YTickLabel',{});
+
+    isRef=(ch==refCh);
+    text(ax,0.04,0.95,sprintf('Ch%d%s',ch,repmat('*',1,isRef)), ...
+         'Units','normalized','FontName',fontName,'FontSize',7,'FontWeight','bold', ...
+         'Color',[0.1 0.1 0.1],'VerticalAlignment','top');
+    if ~isempty(onTimes)&&~isempty(offTimes)
+        text(ax,0.96,0.95,sprintf('%.0fms',nanmedian(offTimes)-nanmedian(onTimes)), ...
+             'Units','normalized','FontName',fontName,'FontSize',6, ...
+             'HorizontalAlignment','right','Color',colOffset,'VerticalAlignment','top');
+    end
+
+end
+
+annotation(hFig,'textbox',[0.01 0.96 0.98 0.04], ...
+    'String',sprintf('%s | Final %d channels (* = reference) | Blue=onset Gold=offset | Mean trace (%s)', ...
+    PID,nCh,cond),'FontName',fontName,'FontSize',8,'EdgeColor','none', ...
+    'HorizontalAlignment','center','FitBoxToText','off');
+drawnow;
+
+outFig=fullfile(outFolder,sprintf('%s_ChannelValidation%s',PID,outSuffix));
+safeExportFigure(hFig, outFig);
+end
+
+function safeExportFigure(hFig, outPathNoExt)
+if isempty(hFig) || ~isgraphics(hFig)
+    warning('Figure handle is invalid - skipping export of %s (.pdf/.png)', outPathNoExt);
+    return
+end
+try
+    exportgraphics(hFig, [outPathNoExt '.pdf'], 'ContentType', 'image', ...
+        'Resolution', 300, 'BackgroundColor', 'white');
+    exportgraphics(hFig, [outPathNoExt '.png'], 'Resolution', 300, ...
+        'BackgroundColor', 'white');
+    fprintf('Saved: %s.pdf / .png\n', outPathNoExt);
+catch ME
+    warning('Export failed for %s (.pdf/.png): %s', outPathNoExt, ME.message);
+end
+end
+
+function rc = chan2rcMap()
+rc = nan(64,2);
+for ch = 1:64
+    if ch>=1 && ch<=12
+        r = ch+1; c = 1;
+    elseif ch>=13 && ch<=25
+        r = 26-ch; c = 2;
+    elseif ch>=26 && ch<=38
+        r = ch-25; c = 3;
+    elseif ch>=39 && ch<=51
+        r = 52-ch; c = 4;
+    else
+        r = ch-51; c = 5;
+    end
+    rc(ch,:) = [r c];
+end
+end
+
+function drawChannelGridPanel(ax, values, mode, highlightSet, cLim)
+rc = chan2rcMap();
+cmap = parula(256);
+axes(ax); %#ok<LAXES>
+hold(ax, 'on');
+
+for ch = 1:64
+    r = rc(ch,1); c = rc(ch,2);
+    v = values(ch);
+
+    switch mode
+        case 'all'
+            if isnan(v)
+                faceColor = [0.85 0.85 0.85];
+                labelStr = sprintf('%d', ch);
+            else
+                faceColor = val2rgb(v, cLim, cmap);
+                labelStr = sprintf('%d\n%.1f', ch, v);
+            end
+            edgeColor = [1 1 1]; lw = 0.5;
+        case 'selected'
+            if ismember(ch, highlightSet) && ~isnan(v)
+                faceColor = val2rgb(v, cLim, cmap);
+                labelStr = sprintf('%d\n%.1f', ch, v);
+                edgeColor = [0.20 0.60 0.20]; lw = 2.5;
+            else
+                faceColor = [0.85 0.85 0.85];
+                labelStr = '';
+                edgeColor = [1 1 1]; lw = 0.5;
+            end
+        otherwise
+            error('Unknown mode %s', mode);
+    end
+
+    rectangle(ax, 'Position', [c-0.5, r-0.5, 1, 1], ...
+        'FaceColor', faceColor, 'EdgeColor', edgeColor, 'LineWidth', lw);
+    if ~isempty(labelStr)
+        text(ax, c, r, labelStr, 'HorizontalAlignment', 'center', ...
+            'VerticalAlignment', 'middle', 'FontSize', 7);
+    end
+end
+
+% row1,col1 has no electrode on this grid - draw it blank/white
+rectangle(ax, 'Position', [1-0.5, 1-0.5, 1, 1], 'FaceColor', 'w', 'EdgeColor', 'none');
+
+xlim(ax, [0.5 5.5]); ylim(ax, [0.5 13.5]);
+set(ax, 'YDir', 'reverse', 'XTick', 1:5, 'YTick', 1:13, 'Box', 'on', 'FontSize', 8);
+xlabel(ax, 'Col'); ylabel(ax, 'Row');
+
+end
+
+function rgb = val2rgb(v, cLim, cmap)
+if cLim(2) <= cLim(1)
+    idx = 1;
+else
+    idx = round(1 + (v - cLim(1)) / (cLim(2) - cLim(1)) * (size(cmap,1) - 1));
+    idx = min(max(idx, 1), size(cmap,1));
+end
+rgb = cmap(idx, :);
+end
+
+function cLim = safeCLim(values)
+finiteVals = values(isfinite(values));
+if isempty(finiteVals)
+    warning('safeCLim: no finite values found - using default [0 1] color scale.');
+    cLim = [0 1];
+    return
+end
+lo = min(finiteVals);
+hi = max(finiteVals);
+if hi <= lo
+    pad = max(abs(lo) * 0.1, 0.5);
+    cLim = [lo - pad, lo + pad];
+else
+    cLim = [lo, hi];
+end
+end
+
+function drawChannelGridFigure(panelSpecs, groupHeaders, figTitle, cLim, outFileNoExt)
+nPanels = numel(panelSpecs);
+hFig = figure('Color', 'w', 'Units', 'normalized', 'Position', [0.03 0.08 0.94 0.80]);
+
+
+mainTitleY  = [0.945 0.995];   % top-most: overall figure title
+groupHdrY   = [0.885 0.935];   % group headers ("10% MVC" / "20% MVC")
+axTop       = 0.83;            % axes stop here; panel title() draws
+                                % just above this, inside the gap
+                                % below groupHdrY(1)=0.885
+axBottom    = 0.08;
+%% FIX #5: mr widened (0.03 -> 0.10) to reserve real room for the
+%% colorbar, and gap widened (0.018 -> 0.032) for clearer panel
+%% separation. Previously panel 4's right edge landed at ~0.97,
+%% past the colorbar's fixed x=0.955 -> direct overlap. spW now also
+%% comes out narrower as a side effect, which is the "narrower
+%% columns" ask.
+ml = 0.045; mr = 0.10;
+gap = 0.032;
+
+spW = (1 - ml - mr - gap*(nPanels-1)) / nPanels;
+spH = axTop - axBottom;
+
+for p = 1:nPanels
+    xP = ml + (p-1)*(spW+gap);
+    ax = axes('Units','normalized','Position',[xP axBottom spW spH]); %#ok<LAXES>
+    drawChannelGridPanel(ax, panelSpecs(p).values, panelSpecs(p).mode, ...
+        panelSpecs(p).highlightSet, cLim);
+    title(ax, panelSpecs(p).titleStr, 'FontWeight', 'bold', 'FontSize', 9);
+end
+
+colormap(parula(256));
+%% FIX #5 cont.: colorbar shifted right + given its own clear lane
+%% (last panel's right edge is now ~0.905, colorbar starts at 0.93).
+cb = colorbar('Position', [0.93 axBottom 0.016 spH]);
+caxis(cLim); %#ok<CAXIS>
+ylabel(cb, 'SNR');
+
+
+annotation(hFig, 'textbox', [0 mainTitleY(1) 1 diff(mainTitleY)], ...
+    'String', figTitle, 'FontWeight', 'bold', 'FontSize', 14, ...
+    'EdgeColor', 'none', 'HorizontalAlignment', 'center', ...
+    'VerticalAlignment', 'middle');
+
+for g = 1:numel(groupHeaders)
+    gh = groupHeaders{g};
+    pos = gh.pos;
+    pos(2) = groupHdrY(1);
+    pos(4) = diff(groupHdrY);
+    annotation(hFig, 'textbox', pos, 'String', gh.text, ...
+        'FontWeight', 'bold', 'FontSize', 13, 'Color', gh.color, ...
+        'EdgeColor', 'none', 'HorizontalAlignment', 'center', ...
+        'VerticalAlignment', 'middle');
+end
+
+drawnow;
+safeExportFigure(hFig, outFileNoExt);
+
+end
