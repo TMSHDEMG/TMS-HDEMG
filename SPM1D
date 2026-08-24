@@ -1,0 +1,259 @@
+clearvars; close all; clc;
+
+% SPM1D toolbox 
+SPM1D_DIR = '/Users/';
+if exist(SPM1D_DIR, 'dir')
+    addpath(SPM1D_DIR);
+else
+    warning('SPM1D folder not found at %s - significance bar will show "SPM1D not available".', SPM1D_DIR);
+end
+
+%% ============================ CONFIG ================================
+PID_LIST     = {'F6','F8','F9','F10','F12'};
+CONDITIONS   = {'C1','C2','C3','C4'};
+DATA_ROOT    = '/Users/ktduo/Desktop';
+OUT_DIR      = fullfile(DATA_ROOT, 'GroupResults');
+if ~exist(OUT_DIR, 'dir'), mkdir(OUT_DIR); end
+
+BASELINE_CHOICE = 'late_only';
+BAND_NAME    = 'Beta_13to30Hz';
+ZOOM_MS      = [-50 200];
+STAT_WIN_MS  = [0 50];    % NEW - narrowed from [0 200]: focuses the test
+                            % and peak search on the immediate post-SP
+                            % burst window, not the long flat/noisy tail.
+                            % Display window (ZOOM_MS) unchanged.
+SPM_ALPHA    = 0.05;
+
+LABEL_DIFF_BETA = 'Interaction contrast (double z-score)';
+LABEL_TIME      = 'Time from SP offset (ms)';
+
+%% ============================ LOAD ALL CONDITIONS ======================
+condData = struct();
+for cIdx = 1:numel(CONDITIONS)
+    cond = CONDITIONS{cIdx};
+    fprintf('Loading Beta traces for %s across %d participants...\n', cond, numel(PID_LIST));
+    [traceMat, timeAxis, loadedPIDs] = load_group_beta_traces(PID_LIST, DATA_ROOT, cond, BASELINE_CHOICE, BAND_NAME);
+    condData.(cond).traceMat   = traceMat;
+    condData.(cond).time_ms    = timeAxis;
+    condData.(cond).loadedPIDs = loadedPIDs;
+    fprintf('  %s: %d/%d participants loaded\n', cond, numel(loadedPIDs), numel(PID_LIST));
+end
+
+allFourPIDs = intersect(intersect(condData.C1.loadedPIDs, condData.C2.loadedPIDs), ...
+                         intersect(condData.C3.loadedPIDs, condData.C4.loadedPIDs));
+nInt = numel(allFourPIDs);
+fprintf('\n%d/%d participants have all 4 conditions: %s\n', nInt, numel(PID_LIST), strjoin(allFourPIDs, ', '));
+assert(nInt >= 3, 'Fewer than 3 participants have all 4 conditions - cannot compute the interaction contrast.');
+
+timeAxis = condData.C1.time_ms;
+[~, i1] = ismember(allFourPIDs, condData.C1.loadedPIDs);
+[~, i2] = ismember(allFourPIDs, condData.C2.loadedPIDs);
+[~, i3] = ismember(allFourPIDs, condData.C3.loadedPIDs);
+[~, i4] = ismember(allFourPIDs, condData.C4.loadedPIDs);
+C1m = condData.C1.traceMat(i1, :);
+C2m = condData.C2.traceMat(i2, :);
+C3m = condData.C3.traceMat(i3, :);
+C4m = condData.C4.traceMat(i4, :);
+
+interactionPerParticipant = (C4m - C3m) - (C2m - C1m);   % [nInt x time]
+
+%% ============================ LAYOUT (absolute inches) =================
+FIG_WIDTH_IN = 7.5;
+FIG_HEIGHT_IN = 4.0;
+fig = figure('Name', 'Intensity x Contraction interaction', 'Color', 'w', ...
+             'Units', 'inches', 'Position', [0.5 0.5 FIG_WIDTH_IN FIG_HEIGHT_IN], ...
+             'PaperUnits', 'inches', 'PaperSize', [FIG_WIDTH_IN FIG_HEIGHT_IN], ...
+             'PaperPosition', [0 0 FIG_WIDTH_IN FIG_HEIGHT_IN]);
+
+ml = 0.10; mr = 0.03; mt = 0.06; mb = 0.14;
+ax = axes('Units','normalized','Position',[ml mb 1-ml-mr 1-mt-mb]); %#ok<LAXES>
+hold(ax, 'on');
+
+tIdxZoom = timeAxis >= ZOOM_MS(1) & timeAxis <= ZOOM_MS(2);
+tZoom = timeAxis(tIdxZoom);
+meanInteraction = mean(interactionPerParticipant(:, tIdxZoom), 1, 'omitnan');
+semInteraction  = std(interactionPerParticipant(:, tIdxZoom), 0, 1, 'omitnan') / sqrt(nInt);
+
+fill(ax, [tZoom, fliplr(tZoom)], [meanInteraction+semInteraction, fliplr(meanInteraction-semInteraction)], ...
+     [0.4 0.2 0.5], 'FaceAlpha', 0.18, 'EdgeColor', 'none', 'HandleVisibility', 'off');
+plot(ax, tZoom, meanInteraction, 'Color', [0.4 0.2 0.5], 'LineWidth', 2, ...
+    'DisplayName', sprintf('(C4-C3)-(C2-C1), n=%d', nInt));
+xline(ax, 0, 'k--', 'LineWidth', 1, 'HandleVisibility', 'off');
+yline(ax, 0, 'Color', [0.2 0.2 0.2], 'LineWidth', 1, 'HandleVisibility', 'off');
+xlim(ax, ZOOM_MS);
+ylabel(ax, LABEL_DIFF_BETA);
+xlabel(ax, LABEL_TIME);
+legend(ax, 'Location', 'best', 'FontSize', 8);
+grid(ax, 'on');
+
+text(ax, 0.02, 0.96, 'Intensity \times Contraction interaction: (C4-C3)-(C2-C1)', ...
+    'Units', 'normalized', 'FontSize', 9, 'VerticalAlignment', 'top', ...
+    'BackgroundColor', [1 1 1 0.75], 'Margin', 1, 'Interpreter', 'tex');
+text(ax, 0.02, 0.86, 'Bar above: SPM1D one-sample test vs. zero, p<0.05', ...
+    'Units', 'normalized', 'FontSize', 6, 'VerticalAlignment', 'top', 'Color', [0.4 0.4 0.4]);
+text(ax, 0.02, 0.78, 'Shaded region: \pm1 SEM', ...
+    'Units', 'normalized', 'FontSize', 6, 'VerticalAlignment', 'top', 'Color', [0.4 0.4 0.4], 'Interpreter', 'tex');
+
+%% ============================ SPM1D ONE-SAMPLE TEST =====================
+spmResult = add_spm1d_onesample_bar(ax, interactionPerParticipant, timeAxis, [0.4 0.2 0.5], ...
+    STAT_WIN_MS, SPM_ALPHA, 1, '(C4-C3)-(C2-C1)');
+
+tIdxStat = timeAxis >= STAT_WIN_MS(1) & timeAxis <= STAT_WIN_MS(2);
+tStat = timeAxis(tIdxStat);
+mStat = mean(interactionPerParticipant(:, tIdxStat), 1, 'omitnan');
+[~, relIdxMax] = max(abs(mStat));
+peakVal = mStat(relIdxMax);
+peakT = tStat(relIdxMax);
+fprintf('\nInteraction contrast peak (largest magnitude, %g-%gms): %.3f z at %.0f ms\n', ...
+    STAT_WIN_MS(1), STAT_WIN_MS(2), peakVal, peakT);
+
+%% ============================ SAVE SUMMARY STATS =======================
+statsOutFile = fullfile(OUT_DIR, 'InteractionEffect_stats.mat');
+save(statsOutFile, 'spmResult', 'peakVal', 'peakT', 'nInt', 'allFourPIDs', 'STAT_WIN_MS', 'SPM_ALPHA', ...
+     'interactionPerParticipant', 'timeAxis');
+fprintf('Saved summary stats: %s\n', statsOutFile);
+
+%% ============================ EXPORT ==================================
+outFig = fullfile(OUT_DIR, 'InteractionEffect_SPM1D');
+try
+    exportgraphics(fig, [outFig '.pdf'], 'ContentType', 'vector', 'BackgroundColor', 'white');
+    exportgraphics(fig, [outFig '.svg'], 'ContentType', 'vector', 'BackgroundColor', 'white');
+    fprintf('Saved %s.pdf / .svg (vector)\n', outFig);
+catch ME
+    warning('Vector export failed (%s) - falling back to high-res raster.', ME.message);
+    exportgraphics(fig, [outFig '.pdf'], 'ContentType', 'image', 'Resolution', 600, 'BackgroundColor', 'white');
+    fprintf('Saved %s.pdf (raster fallback)\n', outFig);
+end
+
+
+%% ======================= LOCAL FUNCTIONS ==============================
+
+function [traceMat, timeAxis, loadedPIDs] = load_group_beta_traces(pidList, dataRoot, cond, baselineChoice, bandName)
+    traceList = {};
+    loadedPIDs = {};
+    timeAxis = [];
+
+    for i = 1:numel(pidList)
+        PID = pidList{i};
+        SP_RESULTS_DIR = fullfile(dataRoot, [PID '_Data'], 'SP_Results');
+        fE = fullfile(SP_RESULTS_DIR, sprintf('%s_%s_ERSP.mat', PID, cond));
+        if exist(fE, 'file') ~= 2
+            warning('Missing %s - skipping %s for %s.', fE, PID, cond);
+            continue
+        end
+        try
+            ERSPone = load(fE);
+            v = pick_band_variant(ERSPone, bandName, baselineChoice);
+            traces = v.perChannelTrace;
+            m = mean(traces, 1, 'omitnan');
+            traceList{end+1} = m; %#ok<AGROW>
+            loadedPIDs{end+1} = PID; %#ok<AGROW>
+            if isempty(timeAxis), timeAxis = v.time_ms; end
+        catch ME
+            warning('%s %s failed to load: %s - skipping.', PID, cond, ME.message);
+            continue
+        end
+    end
+
+    if isempty(traceList)
+        traceMat = [];
+    else
+        traceMat = cat(1, traceList{:});
+    end
+end
+
+
+function v = pick_band_variant(ERSPone, bandName, baselineChoice)
+    getBand = @(name) ERSPone.bands(strcmp({ERSPone.bands.name}, name));
+    b = getBand(bandName);
+
+    requiredFields = {'perTrialTrace', 'perTrialSPDuration', 'baselineSensitivity'};
+    missingFields = requiredFields(~isfield(b, requiredFields));
+    if ~isempty(missingFields)
+        error(['Band "%s" is missing field(s): %s. Rerun ERSP_TF.m for this ' ...
+               'participant/condition.'], bandName, strjoin(missingFields, ', '));
+    end
+
+    v = struct('label', 'default_preSPoffset', 'time_ms', {b.time_ms}, 'freqs', {b.freqs}, ...
+                'avgERSP', {b.avgERSP}, 'perChannelTrace', {b.perChannelTrace}, ...
+                'perTrialTrace', {b.perTrialTrace}, 'perTrialSPDuration', {b.perTrialSPDuration});
+
+    if strcmp(baselineChoice, 'default_preSPoffset')
+        return
+    end
+    if ~isfield(b, 'baselineSensitivity') || isempty(b.baselineSensitivity)
+        warning('%s has no baselineSensitivity variants saved - using the default baseline instead.', bandName);
+        return
+    end
+    hit = strcmp({b.baselineSensitivity.label}, baselineChoice);
+    if ~any(hit)
+        warning('Baseline variant "%s" not found for %s - using the default baseline instead.', baselineChoice, bandName);
+        return
+    end
+    bv = b.baselineSensitivity(hit);
+    v.label = bv.label;
+    v.time_ms = bv.time_ms;
+    v.avgERSP = bv.avgERSP;
+    v.perChannelTrace = bv.perChannelTrace;
+    v.perTrialTrace = bv.perTrialTrace;
+end
+
+
+function result = add_spm1d_onesample_bar(ax, traceMat, timeAxis, color, statWin_ms, alpha, stackRow, bandLabel)
+% One-sample SPM1D test (same implementation as Figure 9's version) -
+% tests whether traceMat's group mean differs significantly from zero,
+% within statWin_ms only. NONPARAMETRIC test tried first (avoids the
+% Random Field Theory lookup-table NaN issue at small n), falls back to
+% parametric only if the nonparametric module isn't available. Always
+% prints an explicit outcome line - never silently ambiguous between
+% "not available" and "no significant cluster".
+    result = struct('bandLabel', bandLabel, 'status', '', 'clusters_ms', {{}});
+
+    if isempty(traceMat) || size(traceMat, 1) < 3
+        result.status = 'too_few_participants';
+        fprintf('  [%s] SPM1D one-sample test: too few participants - not run.\n', bandLabel);
+        return
+    end
+
+    tIdx = timeAxis >= statWin_ms(1) & timeAxis <= statWin_ms(2);
+    tZoom = timeAxis(tIdx);
+    Y = traceMat(:, tIdx);
+
+    try
+        snpm  = spm1d.stats.nonparam.ttest(Y, 0);   % FIX: mu=0 was missing - "Not enough input arguments"
+        snpmi = snpm.inference(alpha, 'two_tailed', true, 'iterations', -1);
+        testUsed = 'nonparametric';
+    catch ME_np
+        try
+            snpm  = spm1d.stats.ttest(Y);
+            snpmi = snpm.inference(alpha, 'two_tailed', true);
+            testUsed = 'parametric';
+        catch ME_p
+            result.status = 'spm1d_unavailable';
+            fprintf('  [%s] SPM1D one-sample test: UNAVAILABLE (%s / %s).\n', bandLabel, ME_np.message, ME_p.message);
+            return
+        end
+    end
+
+    if ~isprop(snpmi, 'clusters') || isempty(snpmi.clusters)
+        result.status = 'no_significant_cluster';
+        fprintf('  [%s] SPM1D one-sample test (%s, p<%.2f): no significant cluster in %g-%gms.\n', ...
+            bandLabel, testUsed, alpha, statWin_ms(1), statWin_ms(2));
+        return
+    end
+
+    result.status = 'significant';
+    yl = ylim(ax);
+    barY = yl(2) - (0.05 + 0.05*(stackRow-1)) * range(yl);
+    clusterRanges = {};
+    for k = 1:numel(snpmi.clusters)
+        ep = snpmi.clusters{k}.endpoints;
+        ep = max(1, min(numel(tZoom), round(ep)));
+        tStart = tZoom(ep(1)); tEnd = tZoom(ep(2));
+        plot(ax, [tStart tEnd], [barY barY], 'Color', color, 'LineWidth', 3, 'HandleVisibility', 'off');
+        clusterRanges{end+1} = sprintf('%.0f-%.0fms', tStart, tEnd); %#ok<AGROW>
+    end
+    result.clusters_ms = clusterRanges;
+    fprintf('  [%s] SPM1D one-sample test (%s, p<%.2f): SIGNIFICANT, cluster(s) at %s.\n', ...
+        bandLabel, testUsed, alpha, strjoin(clusterRanges, ', '));
+end
