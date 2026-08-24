@@ -1,0 +1,1112 @@
+clearvars; close all; clc;
+
+%% ============================ CONFIG ================================
+PID_LIST     = {''};
+CONDITIONS   = {'C1','C2','C3','C4'};
+NBLOCKS      = 2;
+
+SCRIPTS_DIR    = '/mnt/user-data/outputs';   % where faslt_kw.m lives
+if exist(SCRIPTS_DIR, 'dir')
+    addpath(SCRIPTS_DIR);
+end
+assert(exist('faslt_kw', 'file') == 2, ...
+    'faslt_kw.m not found on path - add its folder to SCRIPTS_DIR above.');
+
+% --- Quattrocento field/channel conventions --------
+TRIG_FIELD   = 'QC_AUX_7';
+FORCE_FIELD  = 'QC_AUX_1';
+EMG_PREFIX   = 'QC_MULT_';
+N_EMG_CH     = 64;
+FIRST_TRIG   = 2;           
+FS_RAW       = 5120;        
+
+NOTCH_FREQS_HZ = [50 100];
+NOTCH_BW_HZ    = 2;
+
+% MEP blanking 
+MEPBLANK_MS      = 80;    % primary analysis
+MEPBLANK_SENS_MS = 100;   % high-gamma sensitivity analysis
+
+% Sensitivity-check toggles
+RUN_BASELINE_SENSITIVITY = true;   
+RUN_FILTER_SENSITIVITY   = true;  
+
+%% ============================ BAND CONFIG ============================
+bandIdx = 0;
+BANDS = struct([]);
+
+% ---- Band 1: Beta / low-gamma sweep, epoched to SP offset -------------
+bandIdx = bandIdx + 1;
+BANDS(bandIdx).name           = 'Beta_13to30Hz';
+BANDS(bandIdx).freqs          = 13:0.5:30;    % Hz, 0.5 Hz resolution
+BANDS(bandIdx).timeStep_ms    = 10;           % output time resolution
+BANDS(bandIdx).c1             = 2;            % base wavelet cycles
+BANDS(bandIdx).ksd            = 3;            % Gaussian width (k_sd)
+BANDS(bandIdx).orderRange     = [4 12];       % adaptive order, low->high F
+BANDS(bandIdx).mult           = 1;            % multiplicative superlet
+BANDS(bandIdx).filtBand_Hz    = [8 40];       % bandpass margin around FOI
+BANDS(bandIdx).downFs         = 500;          % Hz 
+BANDS(bandIdx).epochRef       = 'SPoffset';   % per-channel, per-trial t=0
+BANDS(bandIdx).epochWin_ms    = [-500 500];
+BANDS(bandIdx).baselineWin_ms = [700 1300];   
+BANDS(bandIdx).detrend        = true;
+BANDS(bandIdx).normMethod     = 'doubleZ';    
+BANDS(bandIdx).computeWin_ms  = [-1200 1400]; 
+
+% ---- Band 2: Gamma, epoched to SP offset ----
+bandIdx = bandIdx + 1;
+BANDS(bandIdx).name           = 'Gamma_30to80Hz';
+BANDS(bandIdx).freqs          = 30:0.5:80;    % Hz
+BANDS(bandIdx).timeStep_ms    = 10;
+BANDS(bandIdx).c1             = 2;
+BANDS(bandIdx).ksd            = 3;
+BANDS(bandIdx).orderRange     = [4 12];
+BANDS(bandIdx).mult           = 1;
+BANDS(bandIdx).filtBand_Hz    = [20 150];
+BANDS(bandIdx).downFs         = 500;
+BANDS(bandIdx).epochRef       = 'SPoffset';
+BANDS(bandIdx).epochWin_ms    = [-500 500];
+BANDS(bandIdx).baselineWin_ms = [700 1300];
+BANDS(bandIdx).detrend        = true;
+BANDS(bandIdx).normMethod     = 'doubleZ';
+BANDS(bandIdx).computeWin_ms  = [-1200 1400];
+
+% ---- Band 3: High gamma, epoched to SP offset --------------------------
+bandIdx = bandIdx + 1;
+BANDS(bandIdx).name           = 'HighGamma_400to800Hz';
+BANDS(bandIdx).freqs          = 400:10:800;
+BANDS(bandIdx).c1             = 3;
+BANDS(bandIdx).ksd            = 5;
+BANDS(bandIdx).orderRange     = [3 3];
+BANDS(bandIdx).mult           = 1;
+BANDS(bandIdx).filtBand_Hz    = [100 1200];
+BANDS(bandIdx).downFs         = FS_RAW;       
+BANDS(bandIdx).epochRef       = 'SPoffset';
+BANDS(bandIdx).epochWin_ms    = [-500 500];
+BANDS(bandIdx).baselineWin_ms = [700 1300];
+BANDS(bandIdx).detrend        = true;
+BANDS(bandIdx).normMethod     = 'doubleZ';
+BANDS(bandIdx).computeWin_ms  = [-1200 1400];
+
+% ---- High-gamma REBOUND frequency-sensitivity sweep -------
+REBOUND_HG_FREQ_VARIANTS = { ...
+    500:5:600,  ...  % Figure 10 Panel A
+    500:5:700,  ...  % Figure 10 Panel B
+    580:5:620,  ...  % Figure 10 Panel C, variant 1 (40 Hz wide, centered 600)
+    590:2:610,  ...  % Figure 10 Panel C, variant 2 (20 Hz wide, centered 600)
+    595:2.5:605 ...  % Figure 10 Panel C, variant 3 (10 Hz wide, centered 600)
+};
+
+% ---- Baseline-window comparison variants ----
+BASELINE_VARIANTS = struct( ...
+    'label',  {'default_preSPoffset', 'twoPart_pre_and_post', 'late_only'}, ...
+    'win1_ms',{[-400 -300],           [-1000 -500],           [700 1300]}, ...
+    'win2_ms',{[],                    [300 1300],             []} );
+
+%% ============================ BATCH LOOP OVER PARTICIPANTS ===========
+for pidIdx = 1:numel(PID_LIST)
+    PID = PID_LIST{pidIdx};
+    fprintf('\n\n########################################\n');
+    fprintf('### PARTICIPANT %s  (%d/%d)\n', PID, pidIdx, numel(PID_LIST));
+    fprintf('########################################\n');
+
+    try
+        DATA_DIR       = fullfile('/Users/ktduo/Desktop', [PID '_Data']);
+        SP_RESULTS_DIR = fullfile(DATA_DIR, 'SP_Results');
+        OUT_DIR        = SP_RESULTS_DIR;
+
+        %% ===================== LOAD SCRIPT 1 / SCRIPT 2 OUTPUTS =========
+        chanSelFile = fullfile(SP_RESULTS_DIR, sprintf('%s_channel_selection_final.mat', PID));
+        mepSpFile   = fullfile(SP_RESULTS_DIR, sprintf('%s_MEP_SP_Summary.mat', PID));
+
+        if exist(chanSelFile, 'file') ~= 2
+            warning('Missing %s - skipping %s (run Script 1 first).', chanSelFile, PID);
+            continue
+        end
+        if exist(mepSpFile, 'file') ~= 2
+            warning('Missing %s - skipping %s (run Script 2 first).', mepSpFile, PID);
+            continue
+        end
+
+        S           = load(chanSelFile);
+        MEPSP       = load(mepSpFile);
+
+        if isfield(S, 'selectedCh_10') && isfield(S, 'selectedCh_20')
+            selectedCh_10 = S.selectedCh_10(:)';
+            selectedCh_20 = S.selectedCh_20(:)';
+        elseif isfield(S, 'selectedCh')
+            warning(['%s was produced by an older version of Script 1 (single pooled ' ...
+                     'selectedCh). Using it for all conditions - rerun Script 1 to get ' ...
+                     'MVC-level-specific selections.'], chanSelFile);
+            selectedCh_10 = S.selectedCh(:)';
+            selectedCh_20 = S.selectedCh(:)';
+        else
+            warning('%s has neither selectedCh_10/selectedCh_20 nor selectedCh - skipping %s.', chanSelFile, PID);
+            continue
+        end
+
+        fprintf('Loaded %d channels (10%% MVC) and %d channels (20%% MVC) for %s\n', ...
+            numel(selectedCh_10), numel(selectedCh_20), PID);
+        fprintf('  10%% MVC: %s\n', mat2str(selectedCh_10));
+        fprintf('  20%% MVC: %s\n', mat2str(selectedCh_20));
+
+        if isfield(S, 'refCh')
+            refCh = S.refCh;
+        else
+            refCh = [];
+            warning('%s has no refCh field - per-trial SP-duration sorting will fall back to a cross-channel mean.', chanSelFile);
+        end
+
+%% ============================ MAIN LOOP ==============================
+for cIdx = 1:numel(CONDITIONS)
+    cond = CONDITIONS{cIdx};
+    fprintf('\n=== %s %s ===\n', PID, cond);
+
+    if ismember(cond, {'C1','C2'})
+        selectedCh = selectedCh_10;
+    else
+        selectedCh = selectedCh_20;
+    end
+    nSelCh = numel(selectedCh);
+
+    trSPOff = MEPSP.condSummary(cIdx).trSPOff;  % [nTrials x nSelCh] SP offset, ms
+    trSPD   = MEPSP.condSummary(cIdx).trSPD;    % [nTrials x nSelCh or 1] SP duration, ms
+
+    % FIX #3: block/trial -> row-index map. trSPOff/trSPD are indexed by
+    % ROW, not by (block, local-trial-number) - a [block,trial]->rowIdx
+    % lookup table is REQUIRED to know which row a given block/trial's
+    % epoch actually corresponds to. The previous code assumed trSPOff's
+    % rows reset to 1 at the start of every block (using
+    % blockNum*1000+tr as a "key" that was never actually checked
+    % against the real row layout) - if they don't reset, every block-2
+    % epoch was silently pulling block-1's SP offset instead of its own.
+    if ~isfield(MEPSP.condSummary(cIdx), 'trBlockTrials')
+        error(['MEPSP.condSummary(%d).trBlockTrials not found for %s %s - Script 2 must ' ...
+               'save a [nTrials x 2] (block, local trial number) -> row-index map for this ' ...
+               'trial-mapping fix to work. Rerun/update Script 2 before continuing.'], cIdx, PID, cond);
+    end
+    trBlockTrials = MEPSP.condSummary(cIdx).trBlockTrials;  % [nTrials x 2] = [blockNum, localTrialNum]
+
+    refChLocalIdx = [];
+    if ~isempty(refCh)
+        refChLocalIdx = find(selectedCh == refCh, 1);
+    end
+
+    ERSP = struct();
+    ERSP.PID   = PID;
+    ERSP.cond  = cond;
+    ERSP.selectedCh = selectedCh;
+    ERSP.refCh = refCh;
+    ERSP.bands = struct([]);
+
+    for bIdx = 1:numel(BANDS)
+        band = BANDS(bIdx);
+        bandResult = struct();
+        fprintf('  Band: %s\n', band.name);
+
+        allEpochsTF = [];
+        epochCount  = 0;
+        freqAxis    = [];
+        timeAxis_ms = [];
+        epochChLocalIdx = [];
+        epochTrialKey   = [];  % FIX #3: now holds the RESOLVED ROW INDEX
+                                % into trSPOff/trSPD for each epoch's
+                                % trial - not a synthetic blockNum*1000+tr
+                                % key. This also fixes perTrialTrace/
+                                % perTrialSPDuration grouping downstream,
+                                % which relies on this same key.
+
+        if isfield(band, 'computeWin_ms') && ~isempty(band.computeWin_ms)
+            extractWin_ms = band.computeWin_ms;
+        else
+            extractWin_ms = band.epochWin_ms;
+        end
+
+        for blockNum = 1:NBLOCKS
+            rawFile = fullfile(DATA_DIR, sprintf('%s_%s_%d.mat', PID, cond, blockNum));
+            if exist(rawFile, 'file') ~= 2
+                warning('Missing raw file %s - skipping block.', rawFile);
+                continue
+            end
+
+            raw = load_quattrocento_block(rawFile, TRIG_FIELD, FORCE_FIELD, ...
+                                           EMG_PREFIX, N_EMG_CH, FS_RAW);
+
+            trigSamples = raw.trigSamples(FIRST_TRIG:end);
+            nTrialsBlock = numel(trigSamples);
+
+            % ---- MEP blank -> notch filter -> band filter/downsample --
+            emgBlanked  = mep_blank(raw.emg, trigSamples, MEPBLANK_MS, FS_RAW);
+            emgPrepared = apply_notch_filters(emgBlanked, FS_RAW, NOTCH_FREQS_HZ, NOTCH_BW_HZ);  % FIX #5
+            [emgFilt, Fs_ds] = filter_and_downsample(emgPrepared, FS_RAW, ...
+                                    band.filtBand_Hz, band.downFs);
+
+            for chLocalIdx = 1:nSelCh
+                ch = selectedCh(chLocalIdx);
+                sig = emgFilt(ch, :);
+
+                for tr = 1:nTrialsBlock
+                    % FIX #3: resolve this (block, local trial) pair to
+                    % its actual row in trSPOff/trSPD via trBlockTrials,
+                    % instead of assuming row == tr.
+                    rowIdx = find(trBlockTrials(:,1) == blockNum & trBlockTrials(:,2) == tr, 1);
+                    if isempty(rowIdx)
+                        continue
+                    end
+
+                    switch band.epochRef
+                        case 'SPoffset'
+                            spOff_ms = trSPOff(rowIdx, chLocalIdx);
+                            if ~isfinite(spOff_ms)
+                                continue
+                            end
+                            dsFactor_local = FS_RAW / Fs_ds;
+                            trigSamp_ds = round(trigSamples(tr) / dsFactor_local);
+                            t0_ds = trigSamp_ds + round(spOff_ms * Fs_ds / 1000);
+                        case 'TMS'
+                            dsFactor_local = FS_RAW / Fs_ds;
+                            t0_ds = round(trigSamples(tr) / dsFactor_local);
+                        otherwise
+                            error('Unknown epochRef %s', band.epochRef);
+                    end
+
+                    if ~isfinite(t0_ds)
+                        continue
+                    end
+
+                    win_samp = round(extractWin_ms * Fs_ds / 1000);
+                    idx0 = t0_ds + win_samp(1);
+                    idx1 = t0_ds + win_samp(2);
+                    if idx0 < 1 || idx1 > numel(sig)
+                        continue
+                    end
+
+                    epoch = sig(idx0:idx1);
+                    if band.detrend
+                        epoch = detrend(epoch);
+                    end
+
+                    tf = faslt_kw(epoch, Fs_ds, band.freqs, band.c1, ...
+                                  band.orderRange, band.mult, band.ksd);
+
+                    if isempty(allEpochsTF)
+                        nT = size(tf, 2);
+                        freqAxis = band.freqs;
+                        timeAxis_ms = linspace(extractWin_ms(1), extractWin_ms(2), nT);
+                        allEpochsTF = zeros(numel(band.freqs), nT, 0);
+                    end
+
+                    epochCount = epochCount + 1;
+                    allEpochsTF(:, :, epochCount) = tf; %#ok<AGROW>
+                    epochChLocalIdx(epochCount) = chLocalIdx; %#ok<AGROW>
+                    epochTrialKey(epochCount)   = rowIdx; %#ok<AGROW>
+                end
+            end
+        end
+
+        if epochCount == 0
+            warning('No valid epochs for %s %s %s - skipping.', PID, cond, band.name);
+            continue
+        end
+
+        % ---- double z-score normalisation, then HIERARCHICAL averaging
+        %      (FIX #6): average across channels WITHIN each trial first,
+        %      then across trials - not a flat mean across every
+        %      trial-channel epoch (which implicitly gives trials with
+        %      more surviving channels more weight than trials with fewer).
+        [normTF, ~] = double_zscore_normalize(allEpochsTF, timeAxis_ms, ...
+                                                band.baselineWin_ms, band.normMethod);
+        [perTrialTF, ~] = trial_averaged_tf(normTF, epochTrialKey);
+        avgTF = mean(perTrialTF, 3, 'omitnan');
+
+        perChannelTrace = channel_averaged_trace(normTF, epochChLocalIdx, nSelCh);
+        [perTrialTrace, trialKeys] = trial_averaged_trace(normTF, epochTrialKey);
+
+        % perTrialSPDuration: trialKeys are now genuine trSPD row indices
+        % (FIX #3), so this is a direct lookup - no block/trial decoding
+        % needed anymore.
+        perTrialSPDuration = nan(numel(trialKeys), 1);
+        nSPDCols = size(trSPD, 2);
+        for k = 1:numel(trialKeys)
+            rowIdx_k = trialKeys(k);
+            if nSPDCols == 1
+                perTrialSPDuration(k) = trSPD(rowIdx_k, 1);
+            elseif ~isempty(refChLocalIdx) && refChLocalIdx <= nSPDCols
+                perTrialSPDuration(k) = trSPD(rowIdx_k, refChLocalIdx);
+            else
+                perTrialSPDuration(k) = mean(trSPD(rowIdx_k, :), 'omitnan');
+            end
+        end
+
+        % ---- baseline-window sensitivity comparison (SPoffset bands) --
+        baselineSensitivity = struct([]);
+        if RUN_BASELINE_SENSITIVITY && ismember(band.name, {'Beta_13to30Hz','Gamma_30to80Hz','HighGamma_400to800Hz'})
+            for vIdx = 1:numel(BASELINE_VARIANTS)
+                bv = BASELINE_VARIANTS(vIdx);
+                needed = bv.win1_ms;
+                if ~isempty(bv.win2_ms), needed = [needed, bv.win2_ms]; end %#ok<AGROW>
+                if min(needed) < timeAxis_ms(1) || max(needed) > timeAxis_ms(end)
+                    warning('Baseline variant "%s" (%s) falls outside the extracted window (%g to %g ms) for %s - skipping.', ...
+                        bv.label, mat2str(needed), timeAxis_ms(1), timeAxis_ms(end), band.name);
+                    continue
+                end
+                [normTF_bv, ~] = double_zscore_normalize(allEpochsTF, timeAxis_ms, ...
+                                                          bv.win1_ms, band.normMethod, bv.win2_ms);
+                % FIX #6 (also applied here per review point 6): hierarchical
+                % averaging for the baseline-sensitivity outputs too.
+                [perTrialTF_bv, ~] = trial_averaged_tf(normTF_bv, epochTrialKey);
+                avgTF_bv = mean(perTrialTF_bv, 3, 'omitnan');
+                cropIdx_bv = timeAxis_ms >= band.epochWin_ms(1) & timeAxis_ms <= band.epochWin_ms(2);
+
+                perChannelTrace_bv = channel_averaged_trace(normTF_bv, epochChLocalIdx, nSelCh);
+                [perTrialTrace_bv, ~] = trial_averaged_trace(normTF_bv, epochTrialKey);
+
+                bvResult.label   = bv.label;
+                bvResult.win1_ms = bv.win1_ms;
+                bvResult.win2_ms = bv.win2_ms;
+                bvResult.time_ms = timeAxis_ms(cropIdx_bv);
+                bvResult.avgERSP = avgTF_bv(:, cropIdx_bv);
+                bvResult.perChannelTrace = perChannelTrace_bv(:, cropIdx_bv);
+                bvResult.perTrialTrace   = perTrialTrace_bv(:, cropIdx_bv);
+                if isempty(baselineSensitivity), baselineSensitivity = bvResult; else, baselineSensitivity(end+1) = bvResult; end %#ok<AGROW>
+            end
+            if ~isempty(baselineSensitivity)
+                fprintf('    -> baseline sensitivity: %s\n', strjoin({baselineSensitivity.label}, ', '));
+            end
+        end
+
+        % ---- crop back down to the display window ----------------------
+        if isfield(band, 'computeWin_ms') && ~isempty(band.computeWin_ms)
+            cropIdx = timeAxis_ms >= band.epochWin_ms(1) & timeAxis_ms <= band.epochWin_ms(2);
+            avgTF = avgTF(:, cropIdx);
+            perChannelTrace = perChannelTrace(:, cropIdx);
+            perTrialTrace = perTrialTrace(:, cropIdx);
+            timeAxis_ms = timeAxis_ms(cropIdx);
+        end
+
+        bandResult.name        = band.name;
+        bandResult.freqs       = freqAxis;
+        bandResult.nEpochs     = epochCount;
+        bandResult.channels    = selectedCh;
+        bandResult.config      = band;
+        bandResult.baselineSensitivity = baselineSensitivity;
+        bandResult.perTrialKeys = trialKeys;                   % now genuine trSPOff/trSPD row indices
+        bandResult.perTrialSPDuration = perTrialSPDuration;
+
+        if isfield(band, 'timeStep_ms') && ~isempty(band.timeStep_ms)
+            [avgTF, timeAxisOut]     = bin_time_axis(avgTF, timeAxis_ms, band.timeStep_ms);
+            [perChannelTrace, ~]     = bin_time_axis(perChannelTrace, timeAxis_ms, band.timeStep_ms);
+            [perTrialTrace, ~]       = bin_time_axis(perTrialTrace, timeAxis_ms, band.timeStep_ms);
+        else
+            timeAxisOut = timeAxis_ms;
+        end
+        bandResult.time_ms     = timeAxisOut;
+        bandResult.avgERSP     = avgTF;
+        bandResult.perChannelTrace = perChannelTrace;
+        bandResult.perTrialTrace   = perTrialTrace;
+
+        % ---- reverse-only filter sensitivity check (Beta, Gamma only) -
+        bandResult.filterSensitivity = struct([]);
+        if RUN_FILTER_SENSITIVITY && ismember(band.name, {'Beta_13to30Hz','Gamma_30to80Hz'})
+            bandResult.filterSensitivity = run_filter_sensitivity(PID, cond, DATA_DIR, ...
+                NBLOCKS, TRIG_FIELD, FORCE_FIELD, EMG_PREFIX, N_EMG_CH, FS_RAW, ...
+                FIRST_TRIG, MEPBLANK_MS, NOTCH_FREQS_HZ, NOTCH_BW_HZ, selectedCh, ...
+                trSPOff, trBlockTrials, band);
+            fprintf('    -> reverse-only filter check: %d epochs (compare against primary avgERSP/time_ms above)\n', ...
+                bandResult.filterSensitivity.nEpochs);
+        end
+
+        if bIdx == 1, ERSP.bands = bandResult; else, ERSP.bands(end+1) = bandResult; end %#ok<AGROW>
+
+        fprintf('    -> %d epochs pooled, %d trials after channel-then-trial averaging.\n', ...
+            epochCount, size(perTrialTF, 3));
+    end
+
+    % ---- high-gamma REBOUND frequency-sensitivity sweep (Figure 10) ---
+    hgBand = BANDS(strcmp({BANDS.name}, 'HighGamma_400to800Hz'));
+    if ~isempty(hgBand)
+        ERSP.highGammaReboundFreqSensitivity = run_highgamma_rebound_sensitivity(PID, cond, DATA_DIR, ...
+            NBLOCKS, TRIG_FIELD, FORCE_FIELD, EMG_PREFIX, N_EMG_CH, FS_RAW, ...
+            FIRST_TRIG, MEPBLANK_MS, NOTCH_FREQS_HZ, NOTCH_BW_HZ, selectedCh, ...
+            trSPOff, trBlockTrials, hgBand, REBOUND_HG_FREQ_VARIANTS);
+    end
+
+    % ---- MEP-blanking sensitivity (80ms vs 100ms), high-gamma, C4 only -
+    % FIX #2: actually runs the comparison, not just declares the
+    % variable. Only C4 per the review's instruction.
+    if strcmp(cond, 'C4') && ~isempty(hgBand)
+        ERSP.highGammaBlank100Sensitivity = run_highgamma_blanking_sensitivity(PID, cond, DATA_DIR, ...
+            NBLOCKS, TRIG_FIELD, FORCE_FIELD, EMG_PREFIX, N_EMG_CH, FS_RAW, ...
+            FIRST_TRIG, MEPBLANK_SENS_MS, NOTCH_FREQS_HZ, NOTCH_BW_HZ, selectedCh, ...
+            trSPOff, trBlockTrials, hgBand);
+        fprintf('    -> MEP-blanking sensitivity (100ms vs primary 80ms): %d epochs\n', ...
+            ERSP.highGammaBlank100Sensitivity.nEpochs);
+    end
+
+    outFile = fullfile(OUT_DIR, sprintf('%s_%s_ERSP.mat', PID, cond));
+    save(outFile, '-struct', 'ERSP');
+    fprintf('Saved %s\n', outFile);
+end
+
+        fprintf('\nParticipant %s complete (%d conditions).\n', PID, numel(CONDITIONS));
+
+    catch ME
+        warning('Participant %s failed: %s\nSkipping to next participant.', PID, ME.message);
+        continue
+    end
+end
+
+fprintf('\n\n=== Script 3 batch complete: %d participants attempted (%s) ===\n', ...
+    numel(PID_LIST), strjoin(PID_LIST, ', '));
+
+
+%% ======================= LOCAL FUNCTIONS ==============================
+
+function [dataOut, timeOut] = bin_time_axis(dataIn, time_ms, binMs)
+% Bins a [rows x time] array down to binMs-wide time bins by averaging
+% samples within each bin.
+    dt = median(diff(time_ms));
+    if isempty(binMs) || binMs <= dt
+        dataOut = dataIn;
+        timeOut = time_ms;
+        return
+    end
+
+    edges = time_ms(1):binMs:time_ms(end);
+    if isempty(edges) || edges(end) < time_ms(end)
+        edges(end+1) = time_ms(end) + dt;  %#ok<AGROW>
+    end
+    nBins = numel(edges) - 1;
+
+    nRows = size(dataIn, 1);
+    dataOut = nan(nRows, nBins);
+    timeOut = nan(1, nBins);
+
+    for b = 1:nBins
+        if b < nBins
+            idx = time_ms >= edges(b) & time_ms < edges(b+1);
+        else
+            idx = time_ms >= edges(b) & time_ms <= edges(b+1);
+        end
+        if ~any(idx)
+            continue
+        end
+        timeOut(b) = mean(time_ms(idx));
+        dataOut(:, b) = mean(dataIn(:, idx), 2);
+    end
+end
+
+function raw = load_quattrocento_block(rawFile, trigField, forceField, emgPrefix, nCh, fs) %#ok<INUSD>
+% Loads one PID_COND_BLOCK.mat file and returns continuous trigger
+% samples, force trace, and the 64-channel EMG matrix.
+    S = load(rawFile);
+
+    trigRaw  = get_field_flex(S, trigField);
+    forceRaw = get_field_flex(S, forceField);
+
+    emgRaw = cell(1, nCh);
+    for ch = 1:nCh
+        chName = sprintf('%s%d', emgPrefix, ch);
+        emgRaw{ch} = get_field_flex(S, chName);
+    end
+
+    minLen = min([numel(trigRaw), numel(forceRaw), cellfun(@numel, emgRaw)]);
+    maxLen = max([numel(trigRaw), numel(forceRaw), cellfun(@numel, emgRaw)]);
+    if maxLen - minLen > 5
+        warning(['Channel lengths in %s differ by %d samples (more than the usual ' ...
+                 'off-by-one export quirk) - double check this file is not corrupted. ' ...
+                 'Truncating all channels to the shortest (%d samples).'], ...
+                 rawFile, maxLen - minLen, minLen);
+    end
+
+    trig = trigRaw(1:minLen);
+
+    emg = zeros(nCh, minLen);
+    for ch = 1:nCh
+        emg(ch, :) = emgRaw{ch}(1:minLen);
+    end
+
+    thresh = max(trig) / 2;
+    trigSamples = find(diff(trig > thresh) == 1) + 1;
+
+    raw.trig = trig;
+    raw.force = force_trim(forceRaw, minLen);
+    raw.emg = emg;
+    raw.trigSamples = trigSamples;
+end
+
+
+function v = force_trim(v, n)
+    v = v(1:n);
+end
+
+
+function val = get_field_flex(S, fieldName)
+% Fetches fieldName from struct S, unwrapping common OTBioLab+/
+% Quattrocento export layouts.
+    raw = [];
+    if isfield(S, fieldName)
+        raw = S.(fieldName);
+    elseif isfield(S, 'Data') && isstruct(S.Data) && isfield(S.Data, fieldName)
+        raw = S.Data.(fieldName);
+    else
+        error('Field %s not found in raw file (top-level or under .Data). Available top-level fields: %s', ...
+            fieldName, strjoin(fieldnames(S), ', '));
+    end
+
+    if isnumeric(raw)
+        val = double(raw);
+    elseif isstruct(raw)
+        subfieldCandidates = {'Data','data','values','Value','value','signal','y','samples'};
+        hit = subfieldCandidates(isfield(raw, subfieldCandidates));
+        if isempty(hit)
+            error(['Field %s is a struct but none of the expected sample subfields ' ...
+                   '(%s) were found. Its actual fields are: %s. Update get_field_flex ' ...
+                   'with the correct subfield name.'], ...
+                   fieldName, strjoin(subfieldCandidates, ', '), strjoin(fieldnames(raw), ', '));
+        end
+        val = double(raw.(hit{1}));
+    else
+        error('Field %s has unsupported type %s. Update get_field_flex for your file format.', ...
+            fieldName, class(raw));
+    end
+
+    val = val(:)';
+end
+
+
+function emgOut = mep_blank(emgIn, trigSamples, blankMs, fs)
+% Linear interpolation MEP blanking (0 to blankMs post-TMS), applied to
+% the FULL continuous signal, all channels, before any epoching.
+    emgOut = emgIn;
+    blankSamp = round(blankMs * fs / 1000);
+    nCh = size(emgIn, 1);
+    nSamp = size(emgIn, 2);
+
+    for tr = 1:numel(trigSamples)
+        i0 = trigSamples(tr);
+        i1 = min(i0 + blankSamp, nSamp);
+        if i0 < 1 || i0 >= i1
+            continue
+        end
+        for ch = 1:nCh
+            v0 = emgIn(ch, max(i0-1,1));
+            v1 = emgIn(ch, min(i1+1, nSamp));
+            emgOut(ch, i0:i1) = linspace(v0, v1, i1 - i0 + 1);
+        end
+    end
+end
+
+
+function emgOut = apply_notch_filters(emgIn, fs, notchFreqs_Hz, bw_Hz)
+% FIX #5: 50Hz + 100Hz zero-phase IIR notch filtering (bandwidth bw_Hz),
+% applied to every channel - matches Methods 2.5.2, which described this
+% step but the code never actually implemented it. Called after MEP
+% blanking, before any band-specific filtering, in every extraction path
+% in this script (primary, reverse-only filter check, rebound-frequency
+% sweep, MEP-blanking sensitivity).
+    nyq = fs / 2;
+    emgOut = emgIn;
+    nCh = size(emgIn, 1);
+    for f0 = notchFreqs_Hz
+        [bn, an] = iirnotch(f0/nyq, bw_Hz/nyq);
+        for ch = 1:nCh
+            emgOut(ch, :) = filtfilt(bn, an, emgOut(ch, :));
+        end
+    end
+end
+
+
+function [sigOut, fsOut] = filter_and_downsample(sigIn, fsIn, band_Hz, fsOut)
+% Zero-phase Butterworth bandpass (order 4, sos form), then downsample
+% to EXACTLY fsOut using resample() with an exact rational factor.
+%
+% FIX #7: previously used decimate() with dsFactor=round(fsIn/fsOut),
+% which only supports integer decimation factors - fsIn/fsOut=5120/500
+% is NOT an integer (10.24), so decimate() silently rounded that to 10
+% and the "500Hz" output was actually 512Hz (5120/10). Likewise the
+% previous "2000Hz" high-gamma downsampling was actually 1706.7Hz
+% (5120/3, since round(5120/2000)=3). resample(x,p,q) resamples at
+% EXACTLY p/q times the input rate; rat() finds an exact (or best)
+% rational p/q for the requested ratio, so the achieved rate is checked
+% and reported rather than assumed.
+    nyq = fsIn / 2;
+    [z, p, k] = butter(4, band_Hz / nyq, 'bandpass');
+    sos = zp2sos(z, p, k);
+
+    nCh = size(sigIn, 1);
+    sigFilt = zeros(size(sigIn));
+    for ch = 1:nCh
+        sigFilt(ch, :) = filtfilt(sos, 1, sigIn(ch, :));
+    end
+
+    if fsOut >= fsIn
+        sigOut = sigFilt;
+        fsOut = fsIn;
+        return
+    end
+
+    [p, q] = rat(fsOut / fsIn);
+    fsAchieved = fsIn * p / q;
+    if abs(fsAchieved - fsOut) > 0.01
+        warning('resample() could not hit %g Hz exactly - achieved %.4f Hz instead (p=%d, q=%d).', ...
+            fsOut, fsAchieved, p, q);
+    end
+
+    nCh = size(sigFilt, 1);
+    sigOut = [];
+    for ch = 1:nCh
+        chDs = resample(sigFilt(ch, :), p, q);
+        if isempty(sigOut)
+            sigOut = zeros(nCh, numel(chDs));
+        end
+        sigOut(ch, :) = chDs;
+    end
+    fsOut = fsAchieved;
+end
+
+
+function [sigOut, fsOut] = filter_and_downsample_reverseOnly(sigIn, fsIn, band_Hz, fsOut)
+% Same bandpass + downsample as filter_and_downsample, but replaces the
+% zero-phase filtfilt/sos step with a REVERSE-ONLY (anti-causal) filter -
+% see the header/original comment for the full methodological reasoning.
+% FIX #7 applied here too: resample() instead of decimate() for the
+% exact requested rate.
+    nyq = fsIn / 2;
+    [z, p, k] = butter(4, band_Hz / nyq, 'bandpass');
+    sos = zp2sos(z, p, k);
+
+    nCh = size(sigIn, 1);
+    sigFilt = zeros(size(sigIn));
+    for ch = 1:nCh
+        xRev = flip(sigIn(ch, :));
+        yRev = sosfilt(sos, xRev);
+        sigFilt(ch, :) = flip(yRev);
+    end
+
+    if fsOut >= fsIn
+        sigOut = sigFilt;
+        fsOut = fsIn;
+        return
+    end
+
+    [p, q] = rat(fsOut / fsIn);
+    fsAchieved = fsIn * p / q;
+
+    nCh = size(sigFilt, 1);
+    sigOut = [];
+    for ch = 1:nCh
+        chDs = resample(sigFilt(ch, :), p, q);
+        if isempty(sigOut)
+            sigOut = zeros(nCh, numel(chDs));
+        end
+        sigOut(ch, :) = chDs;
+    end
+    fsOut = fsAchieved;
+end
+
+
+function result = run_filter_sensitivity(PID, cond, dataDir, nBlocks, ...
+        trigField, forceField, emgPrefix, nCh, fsRaw, firstTrig, ...
+        mepBlankMs, notchFreqs_Hz, notchBw_Hz, selectedCh, trSPOff, trBlockTrials, band)
+% Re-runs epoching/TF/normalization for one SP-offset-epoched band using
+% filter_and_downsample_reverseOnly instead of the primary filtfilt.
+% FIX #3 (block/trial mapping) and FIX #5 (notch filtering) applied here
+% too, per the review's explicit instruction. FIX #6 (hierarchical
+% averaging) applied as well for direct comparability with the primary
+% result.
+
+    if isfield(band, 'computeWin_ms') && ~isempty(band.computeWin_ms)
+        extractWin_ms = band.computeWin_ms;
+    else
+        extractWin_ms = band.epochWin_ms;
+    end
+
+    epochsTF    = [];
+    timeAxis_ms = [];
+    epochCount  = 0;
+    epochTrialKey = [];
+    nSelCh      = numel(selectedCh);
+
+    for blockNum = 1:nBlocks
+        rawFile = fullfile(dataDir, sprintf('%s_%s_%d.mat', PID, cond, blockNum));
+        if exist(rawFile, 'file') ~= 2, continue; end
+
+        raw = load_quattrocento_block(rawFile, trigField, forceField, ...
+                                       emgPrefix, nCh, fsRaw);
+        trigSamples = raw.trigSamples(firstTrig:end);
+
+        emgBlanked  = mep_blank(raw.emg, trigSamples, mepBlankMs, fsRaw);
+        emgPrepared = apply_notch_filters(emgBlanked, fsRaw, notchFreqs_Hz, notchBw_Hz);
+        [emgFilt, Fs_ds] = filter_and_downsample_reverseOnly(emgPrepared, fsRaw, ...
+                                band.filtBand_Hz, band.downFs);
+
+        for chLocalIdx = 1:nSelCh
+            ch  = selectedCh(chLocalIdx);
+            sig = emgFilt(ch, :);
+
+            for tr = 1:numel(trigSamples)
+                rowIdx = find(trBlockTrials(:,1) == blockNum & trBlockTrials(:,2) == tr, 1);
+                if isempty(rowIdx), continue; end
+
+                spOff_ms = trSPOff(rowIdx, chLocalIdx);
+                if ~isfinite(spOff_ms), continue; end
+                dsFactor_local = fsRaw / Fs_ds;
+                trigSamp_ds = round(trigSamples(tr) / dsFactor_local);
+                t0_ds = trigSamp_ds + round(spOff_ms * Fs_ds / 1000);
+                if ~isfinite(t0_ds), continue; end
+
+                win_samp = round(extractWin_ms * Fs_ds / 1000);
+                idx0 = t0_ds + win_samp(1);
+                idx1 = t0_ds + win_samp(2);
+                if idx0 < 1 || idx1 > numel(sig), continue; end
+
+                epoch = sig(idx0:idx1);
+                if band.detrend, epoch = detrend(epoch); end
+
+                tf = faslt_kw(epoch, Fs_ds, band.freqs, band.c1, ...
+                              band.orderRange, band.mult, band.ksd);
+
+                if isempty(epochsTF)
+                    nT = size(tf, 2);
+                    timeAxis_ms = linspace(extractWin_ms(1), extractWin_ms(2), nT);
+                    epochsTF = zeros(numel(band.freqs), nT, 0);
+                end
+                epochCount = epochCount + 1;
+                epochsTF(:, :, epochCount) = tf; %#ok<AGROW>
+                epochTrialKey(epochCount) = rowIdx; %#ok<AGROW>
+            end
+        end
+    end
+
+    result = struct('label', 'reverse_only', 'freqs', band.freqs, ...
+        'time_ms', [], 'avgERSP', [], 'nEpochs', epochCount);
+
+    if epochCount == 0
+        warning('No epochs for reverse-only filter sensitivity (%s %s %s) - skipping.', PID, cond, band.name);
+        return
+    end
+
+    [normTF, ~] = double_zscore_normalize(epochsTF, timeAxis_ms, band.baselineWin_ms, band.normMethod);
+    [perTrialTF, ~] = trial_averaged_tf(normTF, epochTrialKey);
+    avgTF = mean(perTrialTF, 3, 'omitnan');
+
+    if isfield(band, 'computeWin_ms') && ~isempty(band.computeWin_ms)
+        cropIdx = timeAxis_ms >= band.epochWin_ms(1) & timeAxis_ms <= band.epochWin_ms(2);
+        avgTF = avgTF(:, cropIdx);
+        timeAxis_ms = timeAxis_ms(cropIdx);
+    end
+
+    result.time_ms = timeAxis_ms;
+    result.avgERSP = avgTF;
+end
+
+
+function traceMat = channel_averaged_trace(normTF, epochChLocalIdx, nSelCh)
+% [nSelCh x time], averaging over frequency and over that channel's
+% trials. Row i stays aligned with selectedCh(i) even for a channel with
+% zero surviving epochs (NaN row).
+    nT = size(normTF, 2);
+    traceMat = nan(nSelCh, nT);
+    for ch = 1:nSelCh
+        mask = (epochChLocalIdx == ch);
+        if ~any(mask), continue; end
+        freqTime = mean(normTF(:, :, mask), 3);
+        traceMat(ch, :) = mean(freqTime, 1);
+    end
+end
+
+
+function [traceMat, sortedKeys] = trial_averaged_trace(normTF, epochTrialKey)
+% [nTrials x time], averaging over frequency and over that trial's
+% channels (freq-collapsed - for line-trace outputs). sortedKeys are now
+% genuine trSPOff/trSPD row indices (FIX #3), not synthetic
+% blockNum*1000+tr keys.
+    sortedKeys = unique(epochTrialKey);
+    nT = size(normTF, 2);
+    traceMat = nan(numel(sortedKeys), nT);
+    for k = 1:numel(sortedKeys)
+        mask = (epochTrialKey == sortedKeys(k));
+        if ~any(mask), continue; end
+        freqTime = mean(normTF(:, :, mask), 3);
+        traceMat(k, :) = mean(freqTime, 1);
+    end
+end
+
+
+function [perTrialTF, sortedKeys] = trial_averaged_tf(normTF, epochTrialKey)
+% NEW (FIX #6): [freq x time x nTrials] - averages over CHANNELS WITHIN
+% EACH TRIAL only, keeping the frequency axis intact (unlike
+% trial_averaged_trace above, which also collapses frequency and is used
+% for a different purpose - line-trace outputs). This is the first stage
+% of the two-stage "average channels within trial, then average trials"
+% hierarchy: callers take mean(perTrialTF, 3, 'omitnan') as the second
+% stage. Replaces the previous flat mean(normTF, 3) across every
+% trial-channel epoch, which implicitly gave trials with more surviving
+% channels more weight than trials with fewer.
+    sortedKeys = unique(epochTrialKey);
+    [nF, nT, ~] = size(normTF);
+    perTrialTF = nan(nF, nT, numel(sortedKeys));
+    for k = 1:numel(sortedKeys)
+        mask = (epochTrialKey == sortedKeys(k));
+        if ~any(mask), continue; end
+        perTrialTF(:, :, k) = mean(normTF(:, :, mask), 3);
+    end
+end
+
+
+function [normTF, avgTF] = double_zscore_normalize(epochsTF, time_ms, baselineWin_ms, method, baselineWin2_ms)
+% epochsTF: [freq x time x epoch]
+% Step 1: within-epoch z-score, per frequency, over the FULL analysis
+%         window (each epoch normalized to its own mean/SD).
+% Step 2: re-normalize using the mean/SD of the pooled baseline period(s),
+%         pooled across epochs (trials x channels) AND across both
+%         windows if two are given, per frequency.
+%
+% NOTE: the avgTF returned here is the FLAT mean(normTF,3) - kept for any
+% caller that still wants it, but as of FIX #6 the main pipeline ignores
+% this return value and computes avgTF itself via trial_averaged_tf's
+% two-stage hierarchy instead (channels-within-trial, then trials).
+    if nargin < 5
+        baselineWin2_ms = [];
+    end
+
+    if strcmpi(method, 'log10Z')
+        epochsTF = log10(epochsTF + eps);
+    end
+
+    [nF, nT, nE] = size(epochsTF);
+
+    step1 = zeros(nF, nT, nE);
+    for e = 1:nE
+        mu = mean(epochsTF(:, :, e), 2);
+        sd = std(epochsTF(:, :, e), 0, 2);
+        sd(sd == 0) = eps;
+        step1(:, :, e) = (epochsTF(:, :, e) - mu) ./ sd;
+    end
+
+    baseIdx = time_ms >= baselineWin_ms(1) & time_ms <= baselineWin_ms(2);
+    if ~isempty(baselineWin2_ms)
+        baseIdx = baseIdx | (time_ms >= baselineWin2_ms(1) & time_ms <= baselineWin2_ms(2));
+    end
+    if ~any(baseIdx)
+        warning('Baseline window(s) have no samples in this epoch (range %g to %g ms) - skipping step-2 renormalization.', ...
+            time_ms(1), time_ms(end));
+        normTF = step1;
+    else
+        baselineVals = step1(:, baseIdx, :);
+        baselineVals = reshape(baselineVals, nF, []);
+        muBase = mean(baselineVals, 2);
+        sdBase = std(baselineVals, 0, 2);
+        sdBase(sdBase == 0) = eps;
+
+        normTF = (step1 - muBase) ./ sdBase;
+    end
+
+    avgTF = mean(normTF, 3);  % flat mean - see note above; not used by the main pipeline as of FIX #6
+end
+
+
+function sens = run_highgamma_rebound_sensitivity(PID, cond, dataDir, nBlocks, ...
+        trigField, forceField, emgPrefix, nCh, fsRaw, firstTrig, ...
+        mepBlankMs, notchFreqs_Hz, notchBw_Hz, selectedCh, trSPOff, trBlockTrials, ...
+        hgBandTemplate, freqVariants)
+% Figure 10's data source: re-runs the SP-offset-epoched high-gamma
+% pipeline for each frequency vector in freqVariants. FIX #3 (block/
+% trial mapping), FIX #5 (notch filtering), and FIX #6 (hierarchical
+% averaging) all applied here per the review.
+
+    sens = struct([]);
+    for fIdx = 1:numel(freqVariants)
+        band = hgBandTemplate;
+        band.freqs = freqVariants{fIdx};
+        band.name = sprintf('HighGammaRebound_sens_%d_%dto%dHz', fIdx, ...
+                             round(min(band.freqs)), round(max(band.freqs)));
+
+        if isfield(band, 'computeWin_ms') && ~isempty(band.computeWin_ms)
+            extractWin_ms = band.computeWin_ms;
+        else
+            extractWin_ms = band.epochWin_ms;
+        end
+
+        epochsTF    = [];
+        timeAxis_ms = [];
+        epochCount  = 0;
+        epochTrialKey = [];
+        nSelCh      = numel(selectedCh);
+
+        for blockNum = 1:nBlocks
+            rawFile = fullfile(dataDir, sprintf('%s_%s_%d.mat', PID, cond, blockNum));
+            if exist(rawFile, 'file') ~= 2, continue; end
+
+            raw = load_quattrocento_block(rawFile, trigField, forceField, ...
+                                           emgPrefix, nCh, fsRaw);
+            trigSamples = raw.trigSamples(firstTrig:end);
+
+            emgBlanked  = mep_blank(raw.emg, trigSamples, mepBlankMs, fsRaw);
+            emgPrepared = apply_notch_filters(emgBlanked, fsRaw, notchFreqs_Hz, notchBw_Hz);
+            [emgFilt, Fs_ds] = filter_and_downsample(emgPrepared, fsRaw, ...
+                                    band.filtBand_Hz, band.downFs);
+
+            for chLocalIdx = 1:nSelCh
+                ch  = selectedCh(chLocalIdx);
+                sig = emgFilt(ch, :);
+
+                for tr = 1:numel(trigSamples)
+                    rowIdx = find(trBlockTrials(:,1) == blockNum & trBlockTrials(:,2) == tr, 1);
+                    if isempty(rowIdx), continue; end
+
+                    spOff_ms = trSPOff(rowIdx, chLocalIdx);
+                    if ~isfinite(spOff_ms), continue; end
+                    dsFactor_local = fsRaw / Fs_ds;
+                    trigSamp_ds = round(trigSamples(tr) / dsFactor_local);
+                    t0_ds = trigSamp_ds + round(spOff_ms * Fs_ds / 1000);
+                    if ~isfinite(t0_ds), continue; end
+
+                    win_samp = round(extractWin_ms * Fs_ds / 1000);
+                    idx0 = t0_ds + win_samp(1);
+                    idx1 = t0_ds + win_samp(2);
+                    if idx0 < 1 || idx1 > numel(sig), continue; end
+
+                    epoch = sig(idx0:idx1);
+                    if band.detrend, epoch = detrend(epoch); end
+
+                    tf = faslt_kw(epoch, Fs_ds, band.freqs, band.c1, ...
+                                  band.orderRange, band.mult, band.ksd);
+
+                    if isempty(epochsTF)
+                        nT = size(tf, 2);
+                        timeAxis_ms = linspace(extractWin_ms(1), extractWin_ms(2), nT);
+                        epochsTF = zeros(numel(band.freqs), nT, 0);
+                    end
+                    epochCount = epochCount + 1;
+                    epochsTF(:, :, epochCount) = tf; %#ok<AGROW>
+                    epochTrialKey(epochCount) = rowIdx; %#ok<AGROW>
+                end
+            end
+        end
+
+        result = struct('name', band.name, 'freqs', band.freqs, ...
+            'time_ms', [], 'avgERSP', [], 'nEpochs', epochCount);
+
+        if epochCount == 0
+            warning('No epochs for high-gamma rebound sensitivity band %s - skipping.', band.name);
+        else
+            [normTF, ~] = double_zscore_normalize(epochsTF, timeAxis_ms, ...
+                                                  band.baselineWin_ms, band.normMethod);
+            [perTrialTF, ~] = trial_averaged_tf(normTF, epochTrialKey);
+            avgTF = mean(perTrialTF, 3, 'omitnan');
+
+            if isfield(band, 'computeWin_ms') && ~isempty(band.computeWin_ms)
+                cropIdx = timeAxis_ms >= band.epochWin_ms(1) & timeAxis_ms <= band.epochWin_ms(2);
+                avgTF = avgTF(:, cropIdx);
+                timeAxis_ms = timeAxis_ms(cropIdx);
+            end
+            result.time_ms = timeAxis_ms;
+            result.avgERSP = avgTF;
+            fprintf('    Rebound freq sensitivity %s: %d epochs\n', band.name, epochCount);
+        end
+
+        if isempty(sens), sens = result; else, sens(end+1) = result; end %#ok<AGROW>
+    end
+end
+
+
+function result = run_highgamma_blanking_sensitivity(PID, cond, dataDir, nBlocks, ...
+        trigField, forceField, emgPrefix, nCh, fsRaw, firstTrig, ...
+        mepBlankSensMs, notchFreqs_Hz, notchBw_Hz, selectedCh, trSPOff, trBlockTrials, hgBandTemplate)
+% NEW (FIX #2): actually runs the 100ms MEP-blanking sensitivity analysis
+% for the SP-offset-epoched high-gamma band, condition C4 only, as
+% instructed - not just a declared-but-unused MEPBLANK_SENS_MS variable.
+% Otherwise identical to the primary high-gamma extraction, just with
+% mepBlankSensMs (100ms) in place of the primary 80ms. Compare
+% result.avgERSP/time_ms here directly against the primary
+% HighGamma_400to800Hz bandResult.avgERSP/time_ms for the same
+% participant/condition.
+
+    band = hgBandTemplate;
+
+    if isfield(band, 'computeWin_ms') && ~isempty(band.computeWin_ms)
+        extractWin_ms = band.computeWin_ms;
+    else
+        extractWin_ms = band.epochWin_ms;
+    end
+
+    epochsTF    = [];
+    timeAxis_ms = [];
+    epochCount  = 0;
+    epochTrialKey = [];
+    nSelCh      = numel(selectedCh);
+
+    for blockNum = 1:nBlocks
+        rawFile = fullfile(dataDir, sprintf('%s_%s_%d.mat', PID, cond, blockNum));
+        if exist(rawFile, 'file') ~= 2, continue; end
+
+        raw = load_quattrocento_block(rawFile, trigField, forceField, ...
+                                       emgPrefix, nCh, fsRaw);
+        trigSamples = raw.trigSamples(firstTrig:end);
+
+        emgBlanked  = mep_blank(raw.emg, trigSamples, mepBlankSensMs, fsRaw);  % 100ms, not primary 80ms
+        emgPrepared = apply_notch_filters(emgBlanked, fsRaw, notchFreqs_Hz, notchBw_Hz);
+        [emgFilt, Fs_ds] = filter_and_downsample(emgPrepared, fsRaw, ...
+                                band.filtBand_Hz, band.downFs);
+
+        for chLocalIdx = 1:nSelCh
+            ch  = selectedCh(chLocalIdx);
+            sig = emgFilt(ch, :);
+
+            for tr = 1:numel(trigSamples)
+                rowIdx = find(trBlockTrials(:,1) == blockNum & trBlockTrials(:,2) == tr, 1);
+                if isempty(rowIdx), continue; end
+
+                spOff_ms = trSPOff(rowIdx, chLocalIdx);
+                if ~isfinite(spOff_ms), continue; end
+                dsFactor_local = fsRaw / Fs_ds;
+                trigSamp_ds = round(trigSamples(tr) / dsFactor_local);
+                t0_ds = trigSamp_ds + round(spOff_ms * Fs_ds / 1000);
+                if ~isfinite(t0_ds), continue; end
+
+                win_samp = round(extractWin_ms * Fs_ds / 1000);
+                idx0 = t0_ds + win_samp(1);
+                idx1 = t0_ds + win_samp(2);
+                if idx0 < 1 || idx1 > numel(sig), continue; end
+
+                epoch = sig(idx0:idx1);
+                if band.detrend, epoch = detrend(epoch); end
+
+                tf = faslt_kw(epoch, Fs_ds, band.freqs, band.c1, ...
+                              band.orderRange, band.mult, band.ksd);
+
+                if isempty(epochsTF)
+                    nT = size(tf, 2);
+                    timeAxis_ms = linspace(extractWin_ms(1), extractWin_ms(2), nT);
+                    epochsTF = zeros(numel(band.freqs), nT, 0);
+                end
+                epochCount = epochCount + 1;
+                epochsTF(:, :, epochCount) = tf; %#ok<AGROW>
+                epochTrialKey(epochCount) = rowIdx; %#ok<AGROW>
+            end
+        end
+    end
+
+    result = struct('label', sprintf('mepBlank%dms', mepBlankSensMs), 'freqs', band.freqs, ...
+        'time_ms', [], 'avgERSP', [], 'nEpochs', epochCount);
+
+    if epochCount == 0
+        warning('No epochs for MEP-blanking sensitivity (%s %s, %dms) - skipping.', PID, cond, mepBlankSensMs);
+        return
+    end
+
+    [normTF, ~] = double_zscore_normalize(epochsTF, timeAxis_ms, band.baselineWin_ms, band.normMethod);
+    [perTrialTF, ~] = trial_averaged_tf(normTF, epochTrialKey);
+    avgTF = mean(perTrialTF, 3, 'omitnan');
+
+    if isfield(band, 'computeWin_ms') && ~isempty(band.computeWin_ms)
+        cropIdx = timeAxis_ms >= band.epochWin_ms(1) & timeAxis_ms <= band.epochWin_ms(2);
+        avgTF = avgTF(:, cropIdx);
+        timeAxis_ms = timeAxis_ms(cropIdx);
+    end
+
+    result.time_ms = timeAxis_ms;
+    result.avgERSP = avgTF;
+end
