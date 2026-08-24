@@ -1,0 +1,408 @@
+function MEP_SP_Summary()
+clear; close all; clc;
+
+PID          = 'F';
+CONDITIONS   = {'C1','C2','C3','C4'};
+COND_LABELS  = {'C1 (10%,1mV)','C2 (10%,3mV)','C3 (20%,1mV)','C4 (20%,3mV)'};
+BLOCKS       = [1, 2];
+
+DATA_FOLDER  = sprintf('/Users', PID);
+SP_FILE      = fullfile(DATA_FOLDER,'SP_Results',sprintf('%s_channel_selection_final.mat',PID));
+OUT_FOLDER   = fullfile(DATA_FOLDER,'SP_Results');
+
+TRIG_FIELD   = 'QC_AUX_7';
+FIRST_TRIG   = 2;
+
+% Preprocessing
+NOTCH_BW     = 2;
+HP_CUTOFF    = 20;
+LP_CUTOFF    = 450;
+FILT_ORDER   = 4;
+
+% MEP extraction window (ms post-TMS)
+MEP_WIN_LO   = 8;
+MEP_WIN_HI   = 50;
+
+% Epoch
+PRE_TMS_MS   = 50;
+POST_TMS_MS  = 300;
+
+% Figure colours — one per condition
+COL = [0.40 0.65 0.85;   
+       0.10 0.28 0.58;
+       0.95 0.65 0.35;   
+       0.70 0.22 0.05];  
+
+FONT_NAME = 'Helvetica';
+FONT_AX   = 11;
+FONT_LBL  = 13;
+
+%% ===================================================================
+%% LOAD CHANNEL SELECTION RESULTS
+%% ===================================================================
+fprintf('=== %s MEP + SP Summary ===\n\n',PID);
+if ~isfile(SP_FILE)
+    error('Run Script 1 first: %s not found',SP_FILE);
+end
+S = load(SP_FILE);
+results = S.results;
+
+% Script 1 now saves MVC-level-specific channel selections
+% (selectedCh_10/selectedCh_20) rather than one pooled selectedCh - use
+% whichever the file actually has, condition by condition.
+if isfield(S,'selectedCh_10') && isfield(S,'selectedCh_20')
+    selectedCh_10 = S.selectedCh_10;
+    selectedCh_20 = S.selectedCh_20;
+elseif isfield(S,'selectedCh')
+    warning(['%s was produced by an older version of Script 1 (single pooled ' ...
+             'selectedCh). Using it for all conditions - rerun Script 1 to get ' ...
+             'MVC-level-specific selections.'], SP_FILE);
+    selectedCh_10 = S.selectedCh; %#ok<*NASGU>
+    selectedCh_20 = S.selectedCh;
+else
+    error('%s has neither selectedCh_10/selectedCh_20 nor selectedCh - check Script 1 output.', SP_FILE);
+end
+
+fprintf('Loaded: %d records\n',length(results));
+fprintf('Selected channels (10%% MVC): %s\n',num2str(selectedCh_10));
+fprintf('Selected channels (20%% MVC): %s\n\n',num2str(selectedCh_20));
+
+%% ===================================================================
+%% EXTRACT MEP AMPLITUDE PER TRIAL PER CHANNEL, THEN SUMMARIZE PER BLOCK
+%% ===================================================================
+fprintf('Extracting MEP amplitude...\n');
+
+% condTrialMEP{cIdx} = [nTrials x 1] channel-averaged MEP per trial
+% condTrialSP{cIdx}  = [nTrials x 1] channel-averaged SP duration per trial
+% condBlockTrials{cIdx} = [nTrials x 2] (block, trial) for each entry above
+% condBlockMEP(cIdx,:) / condBlockSPD(cIdx,:) = 1x2 (one value per block),
+%   averaged across that block's trials - THIS is the unit used for the
+%   summary figure and its mean+/-SEM / correlation.
+condTrialMEP    = cell(1,4);
+condTrialSPD    = cell(1,4);
+condTrialSPOff  = cell(1,4);  % SP offset for TF analysis
+condBlockTrials = cell(1,4);
+condBlockMEP    = nan(4, numel(BLOCKS));
+condBlockSPD    = nan(4, numel(BLOCKS));
+
+for cIdx = 1:length(CONDITIONS)
+    cond = CONDITIONS{cIdx};
+
+    if ismember(cond, {'C1','C2'})
+        selectedCh = selectedCh_10;
+    else
+        selectedCh = selectedCh_20;
+    end
+    nCh = numel(selectedCh);
+
+    % Collect all block-trial combinations for this condition
+    condMask  = strcmp({results.condition},cond);
+    condRecs  = results(condMask);
+    if isempty(condRecs), continue; end
+
+    blockTrials = unique([[condRecs.block]' [condRecs.trial]'],'rows');
+    nTr         = size(blockTrials,1);
+
+    trSPD   = nan(nTr,1);
+    trSPOff = nan(nTr,nCh);   % per channel SP offset for TF
+
+    for ti=1:nTr
+        blk = blockTrials(ti,1);
+        tr  = blockTrials(ti,2);
+
+        % Get all channel records for this trial
+        trMask = condMask & [results.block]==blk & [results.trial]==tr;
+        trRecs = results(trMask);
+        if isempty(trRecs), continue; end
+
+        % SP duration: median across channels
+        trSPD(ti)   = nanmedian([trRecs.spDuration_ms]);
+
+        % SP offset per channel (for TF analysis)
+        for ci=1:nCh
+            chRec=trRecs([trRecs.channel]==selectedCh(ci));
+            if ~isempty(chRec)
+                trSPOff(ti,ci)=chRec(1).spOffset_ms;
+            end
+        end
+    end
+
+    % MEP amplitude: load raw data and extract per channel per trial
+    mepPerCh = nan(nTr,nCh);
+
+    for bIdx=1:length(BLOCKS)
+        blk     = BLOCKS(bIdx);
+        rawFile = fullfile(DATA_FOLDER,sprintf('%s_%s_%d.mat',PID,cond,blk));
+        if ~isfile(rawFile), continue; end
+
+        raw    = matfile(rawFile);
+        allVar = who(raw);
+
+        Fs=[];
+        for n=1:64
+            fn=sprintf('QC_MULT_%d',n);
+            if ismember(fn,allVar), st=raw.(fn); Fs=round(1/st.interval); break; end
+        end
+        if isempty(Fs), continue; end
+
+        [bn,an]    = iirnotch(50/(Fs/2),NOTCH_BW/(Fs/2));
+        [bn100,an100]=iirnotch(100/(Fs/2),NOTCH_BW/(Fs/2));
+        [bb,ab]    = butter(FILT_ORDER,[HP_CUTOFF LP_CUTOFF]/(Fs/2),'bandpass');
+
+        tSt   = raw.(TRIG_FIELD);
+        tFull = double(tSt.values)*tSt.scale+tSt.offset;
+        tEdge = find(diff(tFull>0.5*max(tFull))==1)+1;
+        if length(tEdge)<FIRST_TRIG, continue; end
+        triggers = tEdge(FIRST_TRIG:end);
+
+        preSamp  = round(PRE_TMS_MS/1000*Fs);
+        postSamp = round(POST_TMS_MS/1000*Fs);
+        tMs      = (-preSamp:postSamp-1)/Fs*1000;
+        mepMsk   = tMs>=MEP_WIN_LO & tMs<=MEP_WIN_HI;
+
+        % Find which trial indices belong to this block
+        blkTrialMask = blockTrials(:,1)==blk;
+        blkTrialNums = blockTrials(blkTrialMask,2);
+        blkTrialIdx  = find(blkTrialMask);
+
+        for ci=1:nCh
+            ch = selectedCh(ci);
+            cf = sprintf('QC_MULT_%d',ch);
+            if ~ismember(cf,allVar), continue; end
+            st  = raw.(cf);
+            sig = (double(st.values)*st.scale+st.offset)*1000;
+            sigF= filtfilt(bb,ab,filtfilt(bn100,an100,filtfilt(bn,an,sig)));
+
+            for ti=1:length(blkTrialIdx)
+                tr  = blkTrialNums(ti);
+                tIdx= blkTrialIdx(ti);
+                if tr>length(triggers), continue; end
+                tg=triggers(tr); i0=tg-preSamp; i1=tg+postSamp-1;
+                if i0<1||i1>length(sigF), continue; end
+                ep=sigF(i0:i1);
+                mepPerCh(tIdx,ci) = max(ep(mepMsk))-min(ep(mepMsk));
+            end
+        end
+    end
+
+    % Average MEP across channels per trial
+    trMEP = nanmean(mepPerCh,2);
+
+    condTrialMEP{cIdx}    = trMEP;
+    condTrialSPD{cIdx}    = trSPD;
+    condTrialSPOff{cIdx}  = trSPOff;
+    condBlockTrials{cIdx} = blockTrials;
+
+    % ---- summarize per block: this is the unit used for the figure ----
+    for bIdx = 1:numel(BLOCKS)
+        blk = BLOCKS(bIdx);
+        blkMask = blockTrials(:,1)==blk;
+        condBlockMEP(cIdx,bIdx) = nanmean(trMEP(blkMask));
+        condBlockSPD(cIdx,bIdx) = nanmean(trSPD(blkMask));
+    end
+
+    fprintf('  %s: %d trials (blocks: %s) | MEP=%.2f±%.2f mV | SP=%.1f±%.1f ms\n', ...
+            cond, nTr, mat2str(condBlockMEP(cIdx,:),3), nanmean(trMEP), nanstd(trMEP), ...
+            nanmean(trSPD), nanstd(trSPD));
+end
+
+%% ===================================================================
+%% CONDITION-LEVEL SUMMARY 
+%% ===================================================================
+fprintf('\n%s\n',repmat('=',1,70));
+fprintf('CONDITION SUMMARY (block-level): %s\n',PID);
+fprintf('%s\n',repmat('=',1,70));
+fprintf('%-6s  %-8s  %-24s  %-24s\n','Cond','N blocks','MEP pp (mV) mean±SEM','SP dur (ms) mean±SEM');
+fprintf('%s\n',repmat('-',1,70));
+
+condSummary = struct();
+for cIdx=1:length(CONDITIONS)
+    if isempty(condTrialMEP{cIdx}), continue; end
+
+    blkMEP = condBlockMEP(cIdx,:);
+    blkSPD = condBlockSPD(cIdx,:);
+    nBlk   = sum(~isnan(blkMEP));
+
+    condSummary(cIdx).condition    = CONDITIONS{cIdx};
+    condSummary(cIdx).nTrials      = sum(~isnan(condTrialMEP{cIdx}));
+    condSummary(cIdx).nBlocks      = nBlk;
+
+    % block-level (the primary summary statistic used in the figure)
+    condSummary(cIdx).blockMEP     = blkMEP;              % 1x numel(BLOCKS)
+    condSummary(cIdx).blockSPD     = blkSPD;
+    condSummary(cIdx).blockNums    = BLOCKS;
+    condSummary(cIdx).mep_mean     = nanmean(blkMEP);
+    condSummary(cIdx).mep_sem      = nanstd(blkMEP)/sqrt(max(nBlk,1));
+    condSummary(cIdx).spd_mean     = nanmean(blkSPD);
+    condSummary(cIdx).spd_sem      = nanstd(blkSPD)/sqrt(max(nBlk,1));
+
+    % trial-level (kept for reference / other scripts that may want it)
+    condSummary(cIdx).mep_mean_trial   = nanmean(condTrialMEP{cIdx});
+    condSummary(cIdx).mep_sd_trial     = nanstd(condTrialMEP{cIdx});
+    condSummary(cIdx).spd_mean_trial   = nanmean(condTrialSPD{cIdx});
+    condSummary(cIdx).spd_sd_trial     = nanstd(condTrialSPD{cIdx});
+    condSummary(cIdx).trMEP        = condTrialMEP{cIdx};
+    condSummary(cIdx).trSPD        = condTrialSPD{cIdx};
+    condSummary(cIdx).trSPOff      = condTrialSPOff{cIdx};
+    condSummary(cIdx).trBlockTrials= condBlockTrials{cIdx};
+
+    fprintf('%-6s  %-8d  %-24s  %-24s\n', ...
+            CONDITIONS{cIdx}, nBlk, ...
+            sprintf('%.2f ± %.2f',condSummary(cIdx).mep_mean,condSummary(cIdx).mep_sem), ...
+            sprintf('%.1f ± %.1f',condSummary(cIdx).spd_mean,condSummary(cIdx).spd_sem));
+end
+fprintf('%s\n',repmat('=',1,70));
+
+%% ===================================================================
+%% SAVE
+%% ===================================================================
+outMat = fullfile(OUT_FOLDER,sprintf('%s_MEP_SP_Summary.mat',PID));
+save(outMat,'condSummary','selectedCh_10','selectedCh_20','PID','CONDITIONS','COND_LABELS','-v7.3');
+fprintf('\nSaved: %s\n',outMat);
+
+%% ===================================================================
+%% FIGURE: MANIPULATION CHECK (block-level: 2 points per condition)
+%% Panel A: MEP amplitude by condition (2 block points + mean±SEM)
+%% Panel B: SP duration by condition (2 block points + mean±SEM)
+%% Panel C: MEP vs SP duration correlation, block-level points only
+%%          (numel(CONDITIONS)*numel(BLOCKS) points total, one regression)
+%% ===================================================================
+fprintf('\nGenerating manipulation check figure (block-level)...\n');
+
+figW = 183/25.4;
+figH = 160/25.4;
+hFig = figure('Units','inches','Position',[1 1 figW figH],'Color','w', ...
+              'PaperUnits','inches','PaperSize',[figW figH], ...
+              'PaperPosition',[0 0 figW figH]);
+
+ml=0.09; mr=0.04; mt=0.05; mb=0.07;
+hgap=0.08; vgap=0.10;
+topH=(1-mt-mb-vgap)*0.46;
+botH=(1-mt-mb-vgap)*0.54;
+panW=(1-ml-mr-hgap)/2;
+
+axA=axes('Units','normalized','Position',[ml,          mb+botH+vgap, panW, topH]);
+axB=axes('Units','normalized','Position',[ml+panW+hgap,mb+botH+vgap, panW, topH]);
+axC=axes('Units','normalized','Position',[ml,          mb,           1-ml-mr, botH]);
+
+DOT_SIZE = 55;   % larger than before - only 2 points/condition now, not a trial cloud
+MED_SIZE = 10;
+JITTER   = 0.06; % small jitter just so the 2 block dots don't fully overlap
+BLOCK_MARKERS = {'o','^'};  % block 1 = circle, block 2 = triangle
+
+%% Panel A — MEP amplitude (block-level points + mean+/-SEM)
+hold(axA,'on');
+allMEP_blk=[];
+for cIdx=1:4
+    blkMEP = condBlockMEP(cIdx,:);
+    if all(isnan(blkMEP)), continue; end
+    for bIdx=1:numel(BLOCKS)
+        if isnan(blkMEP(bIdx)), continue; end
+        xJit = cIdx + (bIdx-1.5)*JITTER*2;
+        scatter(axA,xJit,blkMEP(bIdx),DOT_SIZE,COL(cIdx,:),BLOCK_MARKERS{bIdx}, ...
+            'filled','MarkerFaceAlpha',0.75,'MarkerEdgeColor','none');
+    end
+    mn=nanmean(blkMEP); sem=nanstd(blkMEP)/sqrt(sum(~isnan(blkMEP)));
+    plot(axA,[cIdx cIdx],[mn-sem mn+sem],'-','Color',COL(cIdx,:),'LineWidth',2.2);
+    plot(axA,[cIdx-0.08 cIdx+0.08],[mn-sem mn-sem],'-','Color',COL(cIdx,:),'LineWidth',2.2);
+    plot(axA,[cIdx-0.08 cIdx+0.08],[mn+sem mn+sem],'-','Color',COL(cIdx,:),'LineWidth',2.2);
+    plot(axA,cIdx,mn,'o','MarkerSize',MED_SIZE,'MarkerFaceColor','w', ...
+         'MarkerEdgeColor',COL(cIdx,:),'LineWidth',2.2);
+    allMEP_blk=[allMEP_blk; blkMEP(:)]; %#ok<AGROW>
+end
+yline(axA,1,':','Color',[0.5 0.5 0.5],'LineWidth',0.8,'Alpha',0.8);
+yline(axA,3,':','Color',[0.5 0.5 0.5],'LineWidth',0.8,'Alpha',0.8);
+yMax_A=max(allMEP_blk)*1.2; if isempty(yMax_A)||isnan(yMax_A)||yMax_A<1, yMax_A=5; end
+text(axA,4.45,1,'1 mV','FontSize',FONT_AX-3,'Color',[0.5 0.5 0.5],'HorizontalAlignment','right','VerticalAlignment','bottom');
+text(axA,4.45,3,'3 mV','FontSize',FONT_AX-3,'Color',[0.5 0.5 0.5],'HorizontalAlignment','right','VerticalAlignment','bottom');
+set(axA,'XTick',1:4,'XTickLabel',CONDITIONS,'FontName',FONT_NAME,'FontSize',FONT_AX,'TickDir','out','Box','off');
+xlim(axA,[0.5 4.5]); ylim(axA,[0 yMax_A]);
+xlabel(axA,'Condition','FontName',FONT_NAME,'FontSize',FONT_AX);
+ylabel(axA,'MEP amplitude (mV)','FontName',FONT_NAME,'FontSize',FONT_AX);
+title(axA,'MEP amplitude','FontName',FONT_NAME,'FontSize',FONT_AX+1,'FontWeight','bold');
+text(axA,0.03,0.97,sprintf('%s Block 1   %s Block 2   Mean \\pm SEM', ...
+     char(9675), char(9651)),'Units','normalized','FontName',FONT_NAME,'FontSize',FONT_AX-3, ...
+     'Color',[0.5 0.5 0.5],'VerticalAlignment','top');
+text(axA,-0.12,1.04,'a','Units','normalized','FontName',FONT_NAME,'FontSize',FONT_LBL+5,'FontWeight','bold');
+
+%% Panel B — SP duration (block-level points + mean+/-SEM)
+hold(axB,'on');
+allSPD_blk=[];
+for cIdx=1:4
+    blkSPD = condBlockSPD(cIdx,:);
+    if all(isnan(blkSPD)), continue; end
+    for bIdx=1:numel(BLOCKS)
+        if isnan(blkSPD(bIdx)), continue; end
+        xJit = cIdx + (bIdx-1.5)*JITTER*2;
+        scatter(axB,xJit,blkSPD(bIdx),DOT_SIZE,COL(cIdx,:),BLOCK_MARKERS{bIdx}, ...
+            'filled','MarkerFaceAlpha',0.75,'MarkerEdgeColor','none');
+    end
+    mn=nanmean(blkSPD); sem=nanstd(blkSPD)/sqrt(sum(~isnan(blkSPD)));
+    plot(axB,[cIdx cIdx],[mn-sem mn+sem],'-','Color',COL(cIdx,:),'LineWidth',2.2);
+    plot(axB,[cIdx-0.08 cIdx+0.08],[mn-sem mn-sem],'-','Color',COL(cIdx,:),'LineWidth',2.2);
+    plot(axB,[cIdx-0.08 cIdx+0.08],[mn+sem mn+sem],'-','Color',COL(cIdx,:),'LineWidth',2.2);
+    plot(axB,cIdx,mn,'o','MarkerSize',MED_SIZE,'MarkerFaceColor','w', ...
+         'MarkerEdgeColor',COL(cIdx,:),'LineWidth',2.2);
+    allSPD_blk=[allSPD_blk; blkSPD(:)]; %#ok<AGROW>
+end
+yMax_B=max(allSPD_blk)*1.15; if isempty(yMax_B)||isnan(yMax_B)||yMax_B<50, yMax_B=200; end
+set(axB,'XTick',1:4,'XTickLabel',CONDITIONS,'FontName',FONT_NAME,'FontSize',FONT_AX,'TickDir','out','Box','off');
+xlim(axB,[0.5 4.5]); ylim(axB,[0 yMax_B]);
+xlabel(axB,'Condition','FontName',FONT_NAME,'FontSize',FONT_AX);
+ylabel(axB,'SP duration (ms)','FontName',FONT_NAME,'FontSize',FONT_AX);
+title(axB,'SP duration','FontName',FONT_NAME,'FontSize',FONT_AX+1,'FontWeight','bold');
+text(axB,0.03,0.97,sprintf('%s Block 1   %s Block 2   Mean \\pm SEM', ...
+     char(9675), char(9651)),'Units','normalized','FontName',FONT_NAME,'FontSize',FONT_AX-3, ...
+     'Color',[0.5 0.5 0.5],'VerticalAlignment','top');
+text(axB,-0.12,1.04,'b','Units','normalized','FontName',FONT_NAME,'FontSize',FONT_LBL+5,'FontWeight','bold');
+
+%% Panel C — MEP vs SP correlation, BLOCK-LEVEL points only
+hold(axC,'on');
+legH=gobjects(1,4);
+mepAll_blk=[]; spdAll_blk=[];
+for cIdx=1:4
+    blkMEP = condBlockMEP(cIdx,:);
+    blkSPD = condBlockSPD(cIdx,:);
+    valid = ~isnan(blkMEP) & ~isnan(blkSPD);
+    if ~any(valid), continue; end
+    legH(cIdx)=scatter(axC,blkMEP(valid),blkSPD(valid),DOT_SIZE,COL(cIdx,:), ...
+                       'filled','MarkerFaceAlpha',0.8,'MarkerEdgeColor','none');
+    mepAll_blk=[mepAll_blk; blkMEP(valid)']; spdAll_blk=[spdAll_blk; blkSPD(valid)']; %#ok<AGROW>
+end
+% Single overall regression, on block-level points
+if length(mepAll_blk)>2
+    p=polyfit(mepAll_blk,spdAll_blk,1);
+    xFit=linspace(min(mepAll_blk)*0.9,max(mepAll_blk)*1.1,200);
+    plot(axC,xFit,polyval(p,xFit),'-','Color',[0.2 0.2 0.2],'LineWidth',2.2);
+    [r,pval]=corr(mepAll_blk,spdAll_blk);
+    pStr=sprintf('p = %.3f',pval); if pval<0.001, pStr='p < 0.001'; end
+    text(axC,0.97,0.06,sprintf('r = %.2f, %s (n=%d blocks)',r,pStr,length(mepAll_blk)), ...
+         'Units','normalized','FontName',FONT_NAME,'FontSize',FONT_AX-1, ...
+         'HorizontalAlignment','right','Color',[0.2 0.2 0.2]);
+    fprintf('\nOverall correlation (block-level): r=%.3f, %s (n=%d blocks)\n',r,pStr,length(mepAll_blk));
+else
+    warning('Fewer than 3 block-level points available - skipping regression/correlation in Panel C.');
+end
+legend(axC,legH,COND_LABELS,'Location','northwest','FontName',FONT_NAME,'FontSize',FONT_AX-2,'Box','off');
+xPad=(max(mepAll_blk)-min(mepAll_blk))*0.1; if isempty(xPad)||xPad==0, xPad=1; end
+yPad=(max(spdAll_blk)-min(spdAll_blk))*0.1; if isempty(yPad)||yPad==0, yPad=10; end
+xlim(axC,[min(mepAll_blk)-xPad max(mepAll_blk)+xPad]);
+ylim(axC,[min(spdAll_blk)-yPad max(spdAll_blk)+yPad]);
+set(axC,'FontName',FONT_NAME,'FontSize',FONT_AX,'TickDir','out','Box','off');
+xlabel(axC,'MEP amplitude (mV)','FontName',FONT_NAME,'FontSize',FONT_AX);
+ylabel(axC,'SP duration (ms)','FontName',FONT_NAME,'FontSize',FONT_AX);
+title(axC,'MEP amplitude vs SP duration (block-level, n=2/condition)','FontName',FONT_NAME,'FontSize',FONT_AX+1,'FontWeight','bold');
+text(axC,-0.06,1.04,'c','Units','normalized','FontName',FONT_NAME,'FontSize',FONT_LBL+5,'FontWeight','bold');
+
+%% Export
+outFig=fullfile(OUT_FOLDER,sprintf('%s_ManipulationCheck',PID));
+try
+    exportgraphics(hFig,[outFig '.pdf'],'ContentType','vector','BackgroundColor','white');
+    exportgraphics(hFig,[outFig '.png'],'Resolution',300,'BackgroundColor','white');
+    fprintf('Figure saved: %s.pdf\n',outFig);
+catch ME
+    warning('Export failed for %s: %s',outFig,ME.message);
+end
+fprintf('\nDone. Next: run ERSP_TF.m\n');
+
+end
